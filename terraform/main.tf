@@ -324,22 +324,23 @@ resource "aws_redshift_subnet_group" "redshift_subnet_group" {
 }
 
 resource "aws_redshift_cluster" "stadiums_cluster" {
-  cluster_identifier = "stadiums-cluster-demo-ra3-vpc" 
+  cluster_identifier = "stadiums-cluster-dev" # Nombre más simple
   
   database_name      = "stadiumsdb"
   master_username    = "adminuser"
   master_password    = "Password123Temporary!"
   
-  # Usamos RA3 para asegurar compatibilidad
-  node_type          = "ra3.xlplus"
-  number_of_nodes    = 2
+  # CAMBIOS CLAVE PARA SER LIVIANO:
+  node_type          = "dc2.large"    # Nodo económico de generación anterior (perfecto para dev)
+  cluster_type       = "single-node"  # Un solo nodo en lugar de multi-nodo
+  # number_of_nodes  = 1              # No es necesario especificarlo en single-node
   
-  publicly_accessible    = true
-  # Conectamos a tu red nueva
+  publicly_accessible       = true
   cluster_subnet_group_name = aws_redshift_subnet_group.redshift_subnet_group.name
   vpc_security_group_ids    = [aws_security_group.redshift_sg.id]
   
-  skip_final_snapshot    = true 
+  skip_final_snapshot       = true 
+  final_snapshot_identifier = "stadiums-final-snapshot"
 }
 
 # ==========================================
@@ -358,4 +359,63 @@ output "redshift_password" {
 
 output "bucket_name" {
   value = aws_s3_bucket.data_lake.id
+}
+
+# ==========================================
+# 7. Gestión de Equipo (IAM)
+# ==========================================
+
+# Grupo de desarrolladores
+resource "aws_iam_group" "developers" {
+  name = "stadiums-project-developers"
+}
+
+# Política: PowerUserAccess (Permite hacer casi todo menos gestión de usuarios/facturación)
+resource "aws_iam_group_policy_attachment" "dev_power_user" {
+  group      = aws_iam_group.developers.name
+  policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
+}
+
+# Usuarios del equipo
+resource "aws_iam_user" "team_member_1" {
+  name = "dev-persona1" # Cambia por su nombre real
+  tags = { Project = "Stadiums" }
+}
+
+resource "aws_iam_user" "team_member_2" {
+  name = "dev-persona2" # Cambia por su nombre real
+  tags = { Project = "Stadiums" }
+}
+
+# Agregar usuarios al grupo
+resource "aws_iam_group_membership" "dev_team" {
+  name = "stadiums-dev-membership"
+  users = [
+    aws_iam_user.team_member_1.name,
+    aws_iam_user.team_member_2.name,
+  ]
+  group = aws_iam_group.developers.name
+}
+
+# Opcional: Crear Access Keys para que ellos corran Terraform desde su PC
+resource "aws_iam_access_key" "key_member_1" {
+  user = aws_iam_user.team_member_1.name
+}
+
+resource "aws_iam_access_key" "key_member_2" {
+  user = aws_iam_user.team_member_2.name
+}
+
+output "team_credentials" {
+  value = {
+    member_1_access_key = aws_iam_access_key.key_member_1.id
+    member_1_secret_key = aws_iam_access_key.key_member_1.secret
+    member_2_access_key = aws_iam_access_key.key_member_2.id
+    member_2_secret_key = aws_iam_access_key.key_member_2.secret
+  }
+  sensitive = true # Tendrás que usar 'terraform output -json' para verlas bien
+}
+
+output "console_login_link" {
+  value = "https://${data.aws_caller_identity.current.account_id}.signin.aws.amazon.com/console"
 }
