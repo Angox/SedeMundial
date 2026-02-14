@@ -1,17 +1,3 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    # Nuevo proveedor para gestionar esperas
-    time = {
-      source  = "hashicorp/time"
-      version = "~> 0.9.0"
-    }
-  }
-}
-
 variable "kaggle_username" {}
 variable "kaggle_key" {}
 
@@ -208,7 +194,6 @@ resource "aws_glue_job" "cleaner" {
     "--enable-continuous-cloudwatch-log" = "true"
   }
 
-  # Importante: Dependemos de la pausa, no del rol directamente
   depends_on = [time_sleep.wait_for_iam]
 }
 
@@ -270,7 +255,7 @@ resource "aws_redshiftserverless_namespace" "stadiums" {
 # --- PAUSA DE REDSHIFT: Esperar a que el Namespace se active ---
 resource "time_sleep" "wait_for_redshift" {
   depends_on = [aws_redshiftserverless_namespace.stadiums]
-  create_duration = "120s" # 2 minutos de espera para seguridad
+  create_duration = "120s"
 }
 
 resource "aws_redshiftserverless_workgroup" "stadiums_wg" {
@@ -279,7 +264,6 @@ resource "aws_redshiftserverless_workgroup" "stadiums_wg" {
   base_capacity  = 32
   publicly_accessible = true 
   
-  # Dependemos de la pausa, no del namespace directamente
   depends_on = [time_sleep.wait_for_redshift]
 
   timeouts {
