@@ -23,7 +23,7 @@ resource "aws_ecr_repository" "lambda_repo" {
   force_delete = true
 }
 
-# --- TRUCO: Subir imagen dummy ---
+# --- TRUCO: Subir imagen dummy para inicializar Lambda ---
 resource "null_resource" "initial_image" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -43,7 +43,7 @@ resource "null_resource" "initial_image" {
 }
 
 # ==========================================
-# 2. Roles de IAM
+# 2. Roles de IAM (Seguridad)
 # ==========================================
 
 # --- Lambda Role ---
@@ -242,33 +242,57 @@ resource "aws_cloudwatch_event_target" "glue_target" {
 }
 
 # ==========================================
-# 5. Redshift Serverless
+# 5. Redshift Provisioned (Cluster Clásico)
 # ==========================================
 
-resource "aws_redshiftserverless_namespace" "stadiums" {
-  namespace_name = "stadiums-namespace"
-  admin_username = "adminuser"
-  admin_user_password = "Password123Temporary!" 
-  db_name = "stadiumsdb"
-}
+# Security Group para permitir acceso externo (Metabase)
+resource "aws_security_group" "redshift_sg" {
+  name        = "stadiums-redshift-sg"
+  description = "Allow Redshift inbound traffic"
 
-# --- PAUSA DE REDSHIFT: Esperar a que el Namespace se active ---
-resource "time_sleep" "wait_for_redshift" {
-  depends_on = [aws_redshiftserverless_namespace.stadiums]
-  create_duration = "120s"
-}
-
-resource "aws_redshiftserverless_workgroup" "stadiums_wg" {
-  namespace_name = "stadiums-namespace"
-  workgroup_name = "stadiums-workgroup"
-  base_capacity  = 32
-  publicly_accessible = true 
-  
-  depends_on = [time_sleep.wait_for_redshift]
-
-  timeouts {
-    create = "60m"
-    update = "60m"
-    delete = "60m"
+  ingress {
+    from_port   = 5439
+    to_port     = 5439
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # Abierto para la demo
   }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Cluster Redshift (Single Node - Rápido y Barato)
+resource "aws_redshift_cluster" "stadiums_cluster" {
+  cluster_identifier = "stadiums-cluster-demo"
+  database_name      = "stadiumsdb"
+  master_username    = "adminuser"
+  master_password    = "Password123Temporary!"
+  node_type          = "dc2.large"
+  cluster_type       = "single-node"
+  
+  publicly_accessible    = true
+  vpc_security_group_ids = [aws_security_group.redshift_sg.id]
+  skip_final_snapshot    = true 
+}
+
+# ==========================================
+# 6. Outputs
+# ==========================================
+
+output "redshift_endpoint" {
+  description = "Host de Redshift para Metabase"
+  value       = replace(aws_redshift_cluster.stadiums_cluster.endpoint, ":5439", "")
+}
+
+output "redshift_password" {
+  value     = aws_redshift_cluster.stadiums_cluster.master_password
+  sensitive = true
+}
+
+output "bucket_name" {
+  value = aws_s3_bucket.data_lake.id
 }
