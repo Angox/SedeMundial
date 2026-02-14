@@ -59,7 +59,10 @@ jobs:
           IMAGE_TAG: latest
         run: |
           cd src/lambda
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          # CORRECCIÓN AQUÍ:
+          # 1. --platform linux/amd64: Asegura compatibilidad con Lambda x86_64
+          # 2. --provenance=false: Evita el error "media type not supported" al desactivar las attestations
+          docker build --platform linux/amd64 --provenance=false -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
       - name: Update Lambda Code
