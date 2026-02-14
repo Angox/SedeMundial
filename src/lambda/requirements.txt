@@ -1,4 +1,8 @@
 kagglehub
 boto3
+# Usamos numpy anterior a la v2 para evitar problemas de compilación en Lambda
+numpy<2.0.0
+# Pandas requiere numpy
 pandas
+# Necesario para df.to_parquet()
 pyarrow
