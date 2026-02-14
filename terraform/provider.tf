@@ -4,10 +4,16 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    # Añadimos el proveedor de tiempo aquí
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9.0"
+    }
   }
-  # Backend S3 para guardar el estado de Terraform (Best Practice)
+  
+  # Backend para guardar el estado
   backend "s3" {
-    bucket         = "mi-empresa-tf-state-lock" # CRÉALO MANUALMENTE PRIMERO
+    bucket         = "mi-empresa-tf-state-lock" # <--- ASEGÚRATE DE QUE ESTE ES TU BUCKET REAL
     key            = "proyectos/stadiums/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
