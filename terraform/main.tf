@@ -1,5 +1,6 @@
 variable "kaggle_username" {}
 variable "kaggle_key" {}
+
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
@@ -12,7 +13,6 @@ resource "aws_s3_bucket" "data_lake" {
   force_destroy = true 
 }
 
-# Activar notificaciones de EventBridge para este bucket
 resource "aws_s3_bucket_notification" "bucket_notification" {
   bucket      = aws_s3_bucket.data_lake.id
   eventbridge = true
@@ -23,11 +23,40 @@ resource "aws_ecr_repository" "lambda_repo" {
   force_delete = true
 }
 
+# --- TRUCO MAGICO: Subir imagen dummy para desbloquear la creación de la Lambda ---
+# Esto descarga una imagen pequeña de AWS pública y la sube a tu repo
+# para que Terraform encuentre "algo" y no falle. Luego GitHub Actions pondrá la real.
+resource "null_resource" "initial_image" {
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<EOF
+      # Loguearse en ECR
+      aws ecr get-login-password --region ${data.aws_region.current.name} | docker login --username AWS --password-stdin ${data.aws_caller_identity.current.account_id}.dkr.ecr.${data.aws_region.current.name}.amazonaws.com
+      
+      # Bajar imagen base ligera (Python) de ECR Público
+      docker pull public.ecr.aws/lambda/python:3.11
+      
+      # Etiquetarla para NUESTRO repo privado
+      docker tag public.ecr.aws/lambda/python:3.11 ${aws_ecr_repository.lambda_repo.repository_url}:latest
+      
+      # Subirla
+      docker push ${aws_ecr_repository.lambda_repo.repository_url}:latest
+    EOF
+  }
+  
+  # Solo ejecutar si el repo cambia (o la primera vez)
+  triggers = {
+    repo_url = aws_ecr_repository.lambda_repo.repository_url
+  }
+  
+  depends_on = [aws_ecr_repository.lambda_repo]
+}
+
 # ==========================================
-# 2. Roles de IAM (Seguridad)
+# 2. Roles de IAM
 # ==========================================
 
-# --- Rol para Lambda (Ingesta) ---
+# --- Lambda Role ---
 resource "aws_iam_role" "lambda_role" {
   name = "stadiums_lambda_ingest_role"
   assume_role_policy = jsonencode({
@@ -60,7 +89,7 @@ resource "aws_iam_role_policy_attachment" "lambda_s3_attach" {
   policy_arn = aws_iam_policy.s3_access_policy.arn
 }
 
-# --- Rol para Glue (Transformación) ---
+# --- Glue Role ---
 resource "aws_iam_role" "glue_role" {
   name = "stadiums_glue_etl_role"
   assume_role_policy = jsonencode({
@@ -79,7 +108,7 @@ resource "aws_iam_role_policy_attachment" "glue_s3_attach" {
   policy_arn = aws_iam_policy.s3_access_policy.arn
 }
 
-# --- Rol para EventBridge Scheduler (Trigger Mensual) ---
+# --- Scheduler Role ---
 resource "aws_iam_role" "scheduler_role" {
   name = "stadiums_scheduler_invoke_role"
   assume_role_policy = jsonencode({
@@ -92,7 +121,7 @@ resource "aws_iam_policy" "scheduler_invoke_policy" {
   name = "scheduler_invoke_lambda_policy"
   policy = jsonencode({
     Version = "2012-10-17",
-    Statement = [{ Action = "lambda:InvokeFunction", Effect = "Allow", Resource = aws_lambda_function.ingestor.arn }]
+    Statement = [{ Action = "lambda:InvokeFunction", Effect = "Allow", Resource = "*" }] # Usamos * temporalmente para evitar dependencias circulares
   })
 }
 
@@ -101,8 +130,7 @@ resource "aws_iam_role_policy_attachment" "scheduler_attach" {
   policy_arn = aws_iam_policy.scheduler_invoke_policy.arn
 }
 
-# --- Rol para EventBridge Rule (Trigger de Glue) ---
-# AQUÍ ESTABA EL ERROR ANTERIOR
+# --- EventBridge Role ---
 resource "aws_iam_role" "eventbridge_glue_role" {
   name = "stadiums_eb_trigger_glue_role"
   assume_role_policy = jsonencode({
@@ -115,7 +143,7 @@ resource "aws_iam_policy" "eb_start_glue_policy" {
   name = "eb_start_glue_job_policy"
   policy = jsonencode({
     Version = "2012-10-17",
-    Statement = [{ Action = "glue:StartJobRun", Effect = "Allow", Resource = aws_glue_job.cleaner.arn }]
+    Statement = [{ Action = "glue:StartJobRun", Effect = "Allow", Resource = "*" }]
   })
 }
 
@@ -132,7 +160,6 @@ resource "aws_lambda_function" "ingestor" {
   function_name = "stadiums-kaggle-ingestor"
   role          = aws_iam_role.lambda_role.arn
   package_type  = "Image"
-  # Usamos una imagen base temporal si es la primera ejecución
   image_uri     = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
   timeout       = 600
   memory_size   = 2048 
@@ -144,9 +171,9 @@ resource "aws_lambda_function" "ingestor" {
       KAGGLE_KEY      = var.kaggle_key
     }
   }
-  lifecycle {
-    ignore_changes = [image_uri]
-  }
+
+  # Esperamos a que la imagen dummy se haya subido
+  depends_on = [null_resource.initial_image, aws_iam_role_policy_attachment.lambda_basic_execution]
 }
 
 resource "aws_glue_job" "cleaner" {
@@ -168,10 +195,13 @@ resource "aws_glue_job" "cleaner" {
     "--enable-metrics" = "true"
     "--enable-continuous-cloudwatch-log" = "true"
   }
+
+  # Esperamos a que el rol se propague
+  depends_on = [aws_iam_role.glue_role, aws_iam_role_policy_attachment.glue_service_role]
 }
 
 # ==========================================
-# 4. Orquestación (Triggers)
+# 4. Orquestación
 # ==========================================
 
 resource "aws_scheduler_schedule" "monthly_trigger" {
@@ -181,55 +211,4 @@ resource "aws_scheduler_schedule" "monthly_trigger" {
     mode = "OFF"
   }
 
-  schedule_expression = "cron(0 10 1 * ? *)"
-
-  target {
-    arn      = aws_lambda_function.ingestor.arn
-    role_arn = aws_iam_role.scheduler_role.arn
-  }
-}
-
-resource "aws_cloudwatch_event_rule" "s3_to_glue_rule" {
-  name        = "trigger-glue-on-s3-upload"
-  description = "Dispara el Glue job cuando se suben objetos a raw/"
-
-  event_pattern = jsonencode({
-    "source": ["aws.s3"],
-    "detail-type": ["Object Created"],
-    "detail": {
-      "bucket": {
-        "name": [aws_s3_bucket.data_lake.id]
-      },
-      "object": {
-        "key": [{ "prefix": "raw/" }]
-      }
-    }
-  })
-}
-
-resource "aws_cloudwatch_event_target" "glue_target" {
-  rule      = aws_cloudwatch_event_rule.s3_to_glue_rule.name
-  target_id = "SendToGlue"
-  arn       = aws_glue_job.cleaner.arn
-  role_arn  = aws_iam_role.eventbridge_glue_role.arn
-}
-
-# ==========================================
-# 5. Redshift Serverless
-# ==========================================
-
-resource "aws_redshiftserverless_namespace" "stadiums" {
-  namespace_name = "stadiums-namespace"
-  admin_username = "adminuser"
-  admin_user_password = "Password123Temporary!" 
-  db_name = "stadiumsdb"
-}
-
-resource "aws_redshiftserverless_workgroup" "stadiums_wg" {
-  namespace_name = "stadiums-namespace"
-  workgroup_name = "stadiums-workgroup"
-  base_capacity  = 32
-  publicly_accessible = true 
-  
-  depends_on = [aws_redshiftserverless_namespace.stadiums]
-}
+  schedule_expression = "
