@@ -3,10 +3,13 @@ variable "kaggle_key" {}
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
-data "aws_availability_zones" "available" {}
+# Obtenemos las zonas disponibles (us-east-1a, us-east-1b, etc.)
+data "aws_availability_zones" "available" {
+  state = "available"
+}
 
 # ==========================================
-# 1. Red y VPC
+# 1. Red y VPC (CORREGIDO PARA MULTI-AZ)
 # ==========================================
 
 resource "aws_vpc" "main" {
@@ -20,13 +23,6 @@ resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main.id
 }
 
-resource "aws_subnet" "public" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = data.aws_availability_zones.available.names[0]
-}
-
 resource "aws_route_table" "public_rt" {
   vpc_id = aws_vpc.main.id
   route {
@@ -35,8 +31,22 @@ resource "aws_route_table" "public_rt" {
   }
 }
 
+# --- CAMBIO IMPORTANTE: Crear 3 Subnets en 3 Zonas distintas ---
+resource "aws_subnet" "public" {
+  count                   = 3 # Creamos 3 subredes
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.${count.index + 1}.0/24" # 10.0.1.0, 10.0.2.0, 10.0.3.0
+  map_public_ip_on_launch = true
+  # Asigna cada subnet a una zona diferente (a, b, c)
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  
+  tags = { Name = "stadiums-public-subnet-${count.index}" }
+}
+
+# Asociar las 3 subredes a la tabla de rutas
 resource "aws_route_table_association" "public_assoc" {
-  subnet_id      = aws_subnet.public.id
+  count          = 3
+  subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public_rt.id
 }
 
@@ -44,28 +54,23 @@ resource "aws_route_table_association" "public_assoc" {
 # 2. IAM - Equipo y Consola
 # ==========================================
 
-# Grupo de desarrolladores
 resource "aws_iam_group" "developers" {
   name = "stadiums-dev-team"
 }
 
-# Permiso PowerUser
 resource "aws_iam_group_policy_attachment" "dev_access" {
   group      = aws_iam_group.developers.name
   policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
 }
 
-# Usuario 1
 resource "aws_iam_user" "member_1" {
   name = "equipo-persona1"
   force_destroy = true
 }
 
-# Perfil de Login para consola
 resource "aws_iam_user_login_profile" "member_1_login" {
   user    = aws_iam_user.member_1.name
-  pgp_key = "keybase:terraform" 
-  
+  pgp_key = "keybase:terraform"
   lifecycle {
     ignore_changes = [password_reset_required, password_length]
   }
@@ -78,7 +83,7 @@ resource "aws_iam_group_membership" "team" {
 }
 
 # ==========================================
-# 3. Storage & Docker
+# 3. Storage & Docker (CORREGIDO RUTA)
 # ==========================================
 
 resource "aws_s3_bucket" "data_lake" {
@@ -94,9 +99,10 @@ resource "aws_ecr_repository" "lambda_repo" {
 resource "null_resource" "build_docker" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
+    # CAMBIO IMPORTANTE: ../src/lambda (subimos un nivel para encontrar la carpeta)
     command     = <<EOF
       aws ecr get-login-password --region ${data.aws_region.current.name} | docker login --username AWS --password-stdin ${data.aws_caller_identity.current.account_id}.dkr.ecr.${data.aws_region.current.name}.amazonaws.com
-      docker build -t ${aws_ecr_repository.lambda_repo.repository_url}:latest ./src/lambda
+      docker build -t ${aws_ecr_repository.lambda_repo.repository_url}:latest ../src/lambda
       docker push ${aws_ecr_repository.lambda_repo.repository_url}:latest
     EOF
   }
@@ -105,7 +111,7 @@ resource "null_resource" "build_docker" {
 }
 
 # ==========================================
-# 4. Lambdas (Ingesta + Limpieza)
+# 4. Lambdas
 # ==========================================
 
 resource "aws_iam_role" "lambda_role" {
@@ -116,19 +122,16 @@ resource "aws_iam_role" "lambda_role" {
   })
 }
 
-# Corrección aquí: líneas separadas
 resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# Corrección aquí: líneas separadas
 resource "aws_iam_role_policy_attachment" "lambda_s3_full" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
 }
 
-# Lambda 1: Ingesta
 resource "aws_lambda_function" "ingestor" {
   function_name = "stadiums-ingestor"
   role          = aws_iam_role.lambda_role.arn
@@ -151,7 +154,6 @@ resource "aws_lambda_function" "ingestor" {
   depends_on = [null_resource.build_docker]
 }
 
-# Lambda 2: Cleaner (Reemplaza a GLUE)
 resource "aws_lambda_function" "cleaner" {
   function_name = "stadiums-cleaner-etl"
   role          = aws_iam_role.lambda_role.arn
@@ -172,7 +174,6 @@ resource "aws_lambda_function" "cleaner" {
   depends_on = [null_resource.build_docker]
 }
 
-# Permiso para S3 invoque a Lambda
 resource "aws_lambda_permission" "allow_s3" {
   statement_id  = "AllowExecutionFromS3"
   action        = "lambda:InvokeFunction"
@@ -181,7 +182,6 @@ resource "aws_lambda_permission" "allow_s3" {
   source_arn    = aws_s3_bucket.data_lake.arn
 }
 
-# Trigger S3 -> Lambda Cleaner
 resource "aws_s3_bucket_notification" "bucket_notification" {
   bucket = aws_s3_bucket.data_lake.id
 
@@ -202,7 +202,6 @@ resource "aws_security_group" "redshift_sg" {
   name        = "stadiums-redshift-sg"
   vpc_id      = aws_vpc.main.id
   
-  # Corrección: Bloques ingress/egress en varias líneas
   ingress {
     from_port   = 5439
     to_port     = 5439
@@ -231,7 +230,8 @@ resource "aws_redshiftserverless_workgroup" "stadiums" {
   namespace_name = aws_redshiftserverless_namespace.stadiums.namespace_name
   base_capacity  = 8 
   
-  subnet_ids             = [aws_subnet.public.id]
+  # CAMBIO IMPORTANTE: Pasamos TODOS los IDs de las 3 subnets creadas
+  subnet_ids             = aws_subnet.public[*].id
   security_group_ids     = [aws_security_group.redshift_sg.id]
   publicly_accessible    = true
 }
