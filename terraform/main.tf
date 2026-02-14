@@ -23,7 +23,7 @@ resource "aws_ecr_repository" "lambda_repo" {
   force_delete = true
 }
 
-# --- TRUCO: Subir imagen dummy para inicializar Lambda ---
+# --- Inicialización de imagen Docker (Truco para evitar error inicial) ---
 resource "null_resource" "initial_image" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -43,7 +43,7 @@ resource "null_resource" "initial_image" {
 }
 
 # ==========================================
-# 2. Roles de IAM (Seguridad)
+# 2. Roles de IAM
 # ==========================================
 
 # --- Lambda Role ---
@@ -142,13 +142,14 @@ resource "aws_iam_role_policy_attachment" "eb_glue_attach" {
   policy_arn = aws_iam_policy.eb_start_glue_policy.arn
 }
 
-# --- PAUSA DE IAM: Esperar a que los permisos se propaguen ---
+# --- PAUSA DE IAM EXTENDIDA (Fix para el error de Glue) ---
+# Subimos a 60 segundos para asegurar que el rol existe antes de usarlo
 resource "time_sleep" "wait_for_iam" {
   depends_on = [
     aws_iam_role_policy_attachment.glue_service_role,
     aws_iam_role_policy_attachment.lambda_basic_execution
   ]
-  create_duration = "30s"
+  create_duration = "60s"
 }
 
 # ==========================================
@@ -242,10 +243,9 @@ resource "aws_cloudwatch_event_target" "glue_target" {
 }
 
 # ==========================================
-# 5. Redshift Provisioned (Cluster Clásico)
+# 5. Redshift Provisioned
 # ==========================================
 
-# Security Group para permitir acceso externo (Metabase)
 resource "aws_security_group" "redshift_sg" {
   name        = "stadiums-redshift-sg"
   description = "Allow Redshift inbound traffic"
@@ -254,7 +254,7 @@ resource "aws_security_group" "redshift_sg" {
     from_port   = 5439
     to_port     = 5439
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # Abierto para la demo
+    cidr_blocks = ["0.0.0.0/0"] 
   }
 
   egress {
@@ -265,18 +265,20 @@ resource "aws_security_group" "redshift_sg" {
   }
 }
 
-# Cluster Redshift (Single Node - Rápido y Barato)
 resource "aws_redshift_cluster" "stadiums_cluster" {
   cluster_identifier = "stadiums-cluster-demo"
   database_name      = "stadiumsdb"
   master_username    = "adminuser"
   master_password    = "Password123Temporary!"
-  node_type          = "dc2.large"
-  cluster_type       = "single-node"
   
-  publicly_accessible    = true
+  # INTENTO 1: Usamos dc2.large (Free Tier elegible)
+  # Si vuelve a fallar con "Invalid node type", cambia esto por "ra3.xlplus" (Pero es caro)
+  node_type          = "dc2.large"
+  
+  cluster_type       = "single-node"
+  publicly_accessible = true
   vpc_security_group_ids = [aws_security_group.redshift_sg.id]
-  skip_final_snapshot    = true 
+  skip_final_snapshot = true 
 }
 
 # ==========================================
@@ -284,7 +286,7 @@ resource "aws_redshift_cluster" "stadiums_cluster" {
 # ==========================================
 
 output "redshift_endpoint" {
-  description = "Host de Redshift para Metabase"
+  description = "Host de Redshift"
   value       = replace(aws_redshift_cluster.stadiums_cluster.endpoint, ":5439", "")
 }
 
