@@ -64,4 +64,12 @@ jobs:
 
       - name: Update Lambda Code
         run: |
-          aws lambda update-function-code --function-name stadiums-kaggle-ingestor --image-uri ${{ steps.login-ecr.outputs.registry }}/stadiums-ingestor:latest
+          # 1. Actualizar Ingestor (Nombre correcto: stadiums-ingestor)
+          aws lambda update-function-code \
+            --function-name stadiums-ingestor \
+            --image-uri ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/stadiums-ingestor:latest
+
+          # 2. Actualizar Cleaner (Nombre correcto: stadiums-cleaner-etl)
+          aws lambda update-function-code \
+            --function-name stadiums-cleaner-etl \
+            --image-uri ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/stadiums-ingestor:latest
