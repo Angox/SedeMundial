@@ -1,3 +1,4 @@
 kagglehub
 boto3
 pandas
+pyarrow
