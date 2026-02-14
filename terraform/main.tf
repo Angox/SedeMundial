@@ -271,3 +271,34 @@ output "console_login_url" {
 output "redshift_host" {
   value = aws_redshiftserverless_workgroup.stadiums.endpoint[0].address
 }
+
+
+# ==========================================
+# TRIGGER MENSUAL (EventBridge)
+# ==========================================
+
+# 1. La Regla: Define CUÁNDO se ejecuta
+resource "aws_cloudwatch_event_rule" "monthly_trigger" {
+  name        = "stadiums-monthly-ingest"
+  description = "Dispara la ingesta de estadios el dia 1 de cada mes"
+  
+  # Sintaxis Cron: Minuto Hora DiaMes Mes DiaSemana Año
+  # Esto se ejecuta a las 00:00 UTC del día 1 de cada mes
+  schedule_expression = "cron(0 0 1 * ? *)"
+}
+
+# 2. El Objetivo: Define QUÉ se ejecuta (Tu Lambda)
+resource "aws_cloudwatch_event_target" "trigger_ingestor_lambda" {
+  rule      = aws_cloudwatch_event_rule.monthly_trigger.name
+  target_id = "TriggerIngestorLambda"
+  arn       = aws_lambda_function.ingestor.arn
+}
+
+# 3. El Permiso: Autoriza a EventBridge a invocar tu Lambda
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ingestor.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.monthly_trigger.arn
+}
