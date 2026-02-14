@@ -99,14 +99,28 @@ resource "aws_ecr_repository" "lambda_repo" {
 resource "null_resource" "build_docker" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    # CAMBIO IMPORTANTE: ../src/lambda (subimos un nivel para encontrar la carpeta)
     command     = <<EOF
+      # 1. Login
       aws ecr get-login-password --region ${data.aws_region.current.name} | docker login --username AWS --password-stdin ${data.aws_caller_identity.current.account_id}.dkr.ecr.${data.aws_region.current.name}.amazonaws.com
-      docker build -t ${aws_ecr_repository.lambda_repo.repository_url}:latest ../src/lambda
+      
+      # 2. Intentar borrar la imagen antigua para evitar conflictos de manifiesto (si falla no importa)
+      aws ecr batch-delete-image --repository-name stadiums-ingestor --image-ids imageTag=latest || true
+      
+      # 3. Construir usando el modo LEGACY (DOCKER_BUILDKIT=0)
+      # Esto garantiza formato Docker V2 Schema 2 compatible con Lambda
+      export DOCKER_BUILDKIT=0
+      docker build --platform linux/amd64 -t ${aws_ecr_repository.lambda_repo.repository_url}:latest ../src/lambda
+      
+      # 4. Subir
       docker push ${aws_ecr_repository.lambda_repo.repository_url}:latest
     EOF
   }
-  triggers = { always_run = timestamp() }
+  
+  # Cambiamos el trigger para forzar que se ejecute siempre
+  triggers = {
+    always_run = timestamp()
+  }
+  
   depends_on = [aws_ecr_repository.lambda_repo]
 }
 
