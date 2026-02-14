@@ -23,7 +23,7 @@ resource "aws_ecr_repository" "lambda_repo" {
   force_delete = true
 }
 
-# --- Inicialización de imagen Docker (Truco para evitar error inicial) ---
+# --- Inicialización de imagen Docker ---
 resource "null_resource" "initial_image" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -142,14 +142,14 @@ resource "aws_iam_role_policy_attachment" "eb_glue_attach" {
   policy_arn = aws_iam_policy.eb_start_glue_policy.arn
 }
 
-# --- PAUSA DE IAM EXTENDIDA (Fix para el error de Glue) ---
-# Subimos a 60 segundos para asegurar que el rol existe antes de usarlo
+# --- PAUSA DE IAM (CRÍTICO: Aumentado a 90s) ---
+# Esto soluciona el error "AccessDenied" en Glue
 resource "time_sleep" "wait_for_iam" {
   depends_on = [
     aws_iam_role_policy_attachment.glue_service_role,
     aws_iam_role_policy_attachment.lambda_basic_execution
   ]
-  create_duration = "60s"
+  create_duration = "90s"
 }
 
 # ==========================================
@@ -195,6 +195,7 @@ resource "aws_glue_job" "cleaner" {
     "--enable-continuous-cloudwatch-log" = "true"
   }
 
+  # Importante: Esperamos explícitamente a que pase el tiempo de propagación
   depends_on = [time_sleep.wait_for_iam]
 }
 
@@ -243,7 +244,7 @@ resource "aws_cloudwatch_event_target" "glue_target" {
 }
 
 # ==========================================
-# 5. Redshift Provisioned
+# 5. Redshift Provisioned (FIXED)
 # ==========================================
 
 resource "aws_security_group" "redshift_sg" {
@@ -266,19 +267,20 @@ resource "aws_security_group" "redshift_sg" {
 }
 
 resource "aws_redshift_cluster" "stadiums_cluster" {
-  cluster_identifier = "stadiums-cluster-demo"
+  # Cambiamos nombre para evitar conflictos si el anterior quedó colgado
+  cluster_identifier = "stadiums-cluster-demo-ra3" 
+  
   database_name      = "stadiumsdb"
   master_username    = "adminuser"
   master_password    = "Password123Temporary!"
   
-  # INTENTO 1: Usamos dc2.large (Free Tier elegible)
-  # Si vuelve a fallar con "Invalid node type", cambia esto por "ra3.xlplus" (Pero es caro)
-  node_type          = "dc2.large"
+  # CAMBIO CRÍTICO: Usamos RA3 porque DC2 falló (tu cuenta no lo permite)
+  node_type          = "ra3.xlplus"
+  number_of_nodes    = 2 # RA3 requiere mínimo 2 nodos
   
-  cluster_type       = "single-node"
-  publicly_accessible = true
+  publicly_accessible    = true
   vpc_security_group_ids = [aws_security_group.redshift_sg.id]
-  skip_final_snapshot = true 
+  skip_final_snapshot    = true 
 }
 
 # ==========================================
