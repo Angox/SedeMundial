@@ -64,12 +64,19 @@ jobs:
 
       - name: Update Lambda Code
         run: |
-          # 1. Actualizar Ingestor (Nombre correcto: stadiums-ingestor)
+          # 1. Obtener el ID de la cuenta dinámicamente (Más seguro que usar secrets fijos)
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGION="us-east-1"
+          ECR_URL="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/stadiums-ingestor:latest"
+          
+          echo "Usando imagen: $ECR_URL"
+
+          # 2. Actualizar Ingestor
           aws lambda update-function-code \
             --function-name stadiums-ingestor \
-            --image-uri ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/stadiums-ingestor:latest
+            --image-uri $ECR_URL
 
-          # 2. Actualizar Cleaner (Nombre correcto: stadiums-cleaner-etl)
+          # 3. Actualizar Cleaner
           aws lambda update-function-code \
             --function-name stadiums-cleaner-etl \
-            --image-uri ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/stadiums-ingestor:latest
+            --image-uri $ECR_URL
