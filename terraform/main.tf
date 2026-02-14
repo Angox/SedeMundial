@@ -1,3 +1,17 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    # Nuevo proveedor para gestionar esperas
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9.0"
+    }
+  }
+}
+
 variable "kaggle_username" {}
 variable "kaggle_key" {}
 
@@ -23,7 +37,7 @@ resource "aws_ecr_repository" "lambda_repo" {
   force_delete = true
 }
 
-# --- TRUCO: Subir imagen dummy para desbloquear la creación de la Lambda ---
+# --- TRUCO: Subir imagen dummy ---
 resource "null_resource" "initial_image" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -142,6 +156,15 @@ resource "aws_iam_role_policy_attachment" "eb_glue_attach" {
   policy_arn = aws_iam_policy.eb_start_glue_policy.arn
 }
 
+# --- PAUSA DE IAM: Esperar a que los permisos se propaguen ---
+resource "time_sleep" "wait_for_iam" {
+  depends_on = [
+    aws_iam_role_policy_attachment.glue_service_role,
+    aws_iam_role_policy_attachment.lambda_basic_execution
+  ]
+  create_duration = "30s"
+}
+
 # ==========================================
 # 3. Cómputo (Lambda y Glue)
 # ==========================================
@@ -162,7 +185,7 @@ resource "aws_lambda_function" "ingestor" {
     }
   }
 
-  depends_on = [null_resource.initial_image, aws_iam_role_policy_attachment.lambda_basic_execution]
+  depends_on = [null_resource.initial_image, time_sleep.wait_for_iam]
 }
 
 resource "aws_glue_job" "cleaner" {
@@ -185,7 +208,8 @@ resource "aws_glue_job" "cleaner" {
     "--enable-continuous-cloudwatch-log" = "true"
   }
 
-  depends_on = [aws_iam_role.glue_role, aws_iam_role_policy_attachment.glue_service_role]
+  # Importante: Dependemos de la pausa, no del rol directamente
+  depends_on = [time_sleep.wait_for_iam]
 }
 
 # ==========================================
@@ -243,13 +267,20 @@ resource "aws_redshiftserverless_namespace" "stadiums" {
   db_name = "stadiumsdb"
 }
 
+# --- PAUSA DE REDSHIFT: Esperar a que el Namespace se active ---
+resource "time_sleep" "wait_for_redshift" {
+  depends_on = [aws_redshiftserverless_namespace.stadiums]
+  create_duration = "120s" # 2 minutos de espera para seguridad
+}
+
 resource "aws_redshiftserverless_workgroup" "stadiums_wg" {
   namespace_name = "stadiums-namespace"
   workgroup_name = "stadiums-workgroup"
   base_capacity  = 32
   publicly_accessible = true 
   
-  depends_on = [aws_redshiftserverless_namespace.stadiums]
+  # Dependemos de la pausa, no del namespace directamente
+  depends_on = [time_sleep.wait_for_redshift]
 
   timeouts {
     create = "60m"
