@@ -10,12 +10,13 @@ terraform {
     }
   }
   
-  # Backend para guardar el estado (MODIFICA EL BUCKET SI ES NECESARIO)
   backend "s3" {
     bucket         = "mi-empresa-tf-state-lock" 
     key            = "proyectos/stadiums/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
+    # AGREGAR ESTO PARA TRABAJO EN EQUIPO
+    dynamodb_table = "terraform-locks" 
   }
 }
 
