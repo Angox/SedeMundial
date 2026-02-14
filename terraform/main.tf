@@ -140,6 +140,9 @@ resource "aws_lambda_function" "ingestor" {
   timeout       = 600
   memory_size   = 2048
   
+  # AGREGAR ESTA LÍNEA
+  architectures = ["x86_64"]
+  
   image_config {
     command = ["main.handler"]
   }
@@ -161,6 +164,9 @@ resource "aws_lambda_function" "cleaner" {
   image_uri     = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
   timeout       = 300
   memory_size   = 1024
+  
+  # AGREGAR ESTA LÍNEA
+  architectures = ["x86_64"]
   
   image_config {
     command = ["main.cleaner_handler"]
