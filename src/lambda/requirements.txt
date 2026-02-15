@@ -1,15 +1,6 @@
-# Boto3 ya viene en Lambda, pero es bueno fijarlo para dev local
 boto3>=1.26.0
-
-# Kagglehub para descargar datos
 kagglehub
-
-# Anclamos numpy a la última versión estable de la serie 1.x
-# Esto evita problemas con numpy 2.0 que a veces requiere compilación
 numpy==1.26.4
-
-# Pandas compatible con numpy 1.x
 pandas>=2.0.0,<2.2.0
-
-# Pyarrow necesario para guardar en parquet (binario)
 pyarrow
+geopy  # <--- NUEVA LIBRERÍA
