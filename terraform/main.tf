@@ -189,6 +189,8 @@ resource "aws_lambda_function" "cleaner" {
   environment {
     variables = {
       S3_BUCKET_NAME = aws_s3_bucket.data_lake.bucket
+      # Añadimos el nombre del índice
+      PLACE_INDEX    = aws_location_place_index.main.index_name 
     }
   }
   depends_on = [null_resource.build_docker]
