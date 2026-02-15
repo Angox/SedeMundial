@@ -210,9 +210,15 @@ resource "aws_s3_bucket_notification" "bucket_notification" {
   lambda_function {
     lambda_function_arn = aws_lambda_function.cleaner.arn
     events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "raw/"
+    
+    # --- CAMBIO AQUÍ ---
+    # Antes: "raw/"
+    # Ahora: Apuntamos solo a la carpeta del ÚLTIMO dataset que sube tu script Python.
+    filter_prefix       = "raw/antimoni_football-stadiums/"
+    
     filter_suffix       = ".csv"
   }
+  
   depends_on = [aws_lambda_permission.allow_s3]
 }
 
