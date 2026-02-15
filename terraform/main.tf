@@ -156,7 +156,8 @@ resource "aws_iam_policy" "lambda_redshift_data_policy" {
           "redshift-data:GetStatementResult",
           "redshift-data:DescribeStatement",
           "redshift-data:ListStatements",
-          "redshift-data:BatchExecuteStatement"
+          "redshift-data:BatchExecuteStatement",
+          "redshift-serverless:GetCredentials"
         ]
         Resource = "*" # Data API no siempre soporta resource restrictions granulares fácilmente
       }
