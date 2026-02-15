@@ -90,12 +90,12 @@ resource "aws_iam_group_policy" "deny_billing" {
 
 # 4. Creamos los usuarios (Sustituye los nombres 'juan' y 'ana' por los reales)
 resource "aws_iam_user" "partner_1" {
-  name          = "juan-ingeniero" # CAMBIAR NOMBRE
+  name          = "josue-ingeniero" # CAMBIAR NOMBRE
   force_destroy = true
 }
 
 resource "aws_iam_user" "partner_2" {
-  name          = "ana-ingeniera"  # CAMBIAR NOMBRE
+  name          = "santiago-ingeniera"  # CAMBIAR NOMBRE
   force_destroy = true
 }
 
@@ -411,10 +411,6 @@ output "bucket_name" {
   value = aws_s3_bucket.data_lake.id 
 }
 
-output "console_login_url" {
-  value = "https://${data.aws_caller_identity.current.account_id}.signin.aws.amazon.com/console"
-}
-
 output "redshift_host" {
   value = aws_redshiftserverless_workgroup.stadiums.endpoint[0].address
 }
@@ -424,11 +420,13 @@ output "redshift_workgroup_name" {
 }
 
 output "partner_1_password" {
-  value = aws_iam_user_login_profile.partner_1_login.password
-  sensitive = false # Para que te la muestre en consola
+  value = nonsensitive(aws_iam_user_login_profile.partner_1_login.password)
 }
 
 output "partner_2_password" {
-  value = aws_iam_user_login_profile.partner_2_login.password
-  sensitive = false
+  value = nonsensitive(aws_iam_user_login_profile.partner_2_login.password)
+}
+
+output "console_login_url" {
+  value = "https://${data.aws_caller_identity.current.account_id}.signin.aws.amazon.com/console"
 }
