@@ -14,6 +14,7 @@ import io
 import glob
 import shutil
 import time
+import unicodedata
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 
@@ -116,30 +117,51 @@ def handler(event, context):
 
 # --- LÓGICA DE PROCESAMIENTO Y ANÁLISIS FIFA ---
 
+def read_csv_from_s3_robust(bucket, key):
+    """Intenta leer un CSV de S3 probando múltiples codificaciones."""
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'ISO-8859-1']
+    
+    for encoding in encodings:
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=key)
+            return pd.read_csv(obj['Body'], encoding=encoding)
+        except UnicodeDecodeError:
+            continue # Prueba el siguiente
+        except Exception as e:
+            print(f"   ⚠️ Error leyendo {key} con {encoding}: {e}")
+            raise e
+    raise ValueError(f"❌ No se pudo leer {key} con ninguna codificación conocida.")
+
+def normalize_text(text):
+    """Normaliza texto para comparaciones (minusculas, sin acentos)."""
+    if pd.isna(text): return ""
+    text = str(text).lower().strip()
+    # Quitar acentos (ej: 'Málaga' -> 'malaga')
+    text = unicodedata.normalize('NFD', text).encode('ascii', 'ignore').decode("utf-8")
+    return text
+
 def get_coordinates(stadium, city, country, geolocator):
-    """Intenta obtener coordenadas con reintentos para evitar timeouts."""
+    """Obtiene coordenadas con manejo de errores."""
     query = f"{stadium}, {city}, {country}"
     try:
-        # Timeout alto y sleep para respetar límites de la API gratuita (1 req/seg)
+        # Timeout generoso para la API
         location = geolocator.geocode(query, timeout=10)
         if location:
             return location.latitude, location.longitude
-        else:
-            # Intento secundario: solo ciudad y país si falla el estadio exacto
-            location = geolocator.geocode(f"{city}, {country}", timeout=10)
-            if location:
-                return location.latitude, location.longitude
-            return None, None
-    except (GeocoderTimedOut, Exception) as e:
-        print(f"   ⚠️ Error geocodificando {query}: {e}")
-        return None, None
+        # Reintento solo con ciudad
+        location = geolocator.geocode(f"{city}, {country}", timeout=10)
+        if location:
+            return location.latitude, location.longitude
+    except:
+        pass
+    return None, None
 
 def cleaner_handler(event, context):
     try:
-        print("⚽ Iniciando Análisis de Candidatos a Copa del Mundo...")
-
-        # 1. Definir los archivos que esperamos encontrar en S3
-        files_to_process = [
+        print("⚽ Iniciando Procesamiento Unificado (Modo Seguro)...")
+        
+        # 1. Definir fuentes
+        sources = [
             {'key': 'raw/rahuldabholkar_world-of-stadiums/all_stadiums.csv', 'type': 'rahul'},
             {'key': 'raw/imtkaggleteam_football-stadiums/Football Stadiums.csv', 'type': 'imtk'},
             {'key': 'raw/antimoni_football-stadiums/Football Stadiums.csv', 'type': 'antimoni'}
@@ -147,107 +169,92 @@ def cleaner_handler(event, context):
 
         dfs = []
         
-        # 2. Leer y Normalizar cada dataset
-        for item in files_to_process:
+        # 2. Carga y Estandarización
+        for source in sources:
             try:
-                print(f"📖 Leyendo: {item['key']}...")
-                obj = s3_client.get_object(Bucket=S3_BUCKET, Key=item['key'])
+                print(f"📖 Leyendo: {source['key']}...")
+                df = read_csv_from_s3_robust(S3_BUCKET, source['key'])
                 
-                # Leemos con 'latin-1' si falla 'utf-8' (común en datasets antiguos)
-                try:
-                    df = pd.read_csv(obj['Body'], encoding='utf-8')
-                except:
-                    obj = s3_client.get_object(Bucket=S3_BUCKET, Key=item['key']) # Re-abrir stream
-                    df = pd.read_csv(obj['Body'], encoding='latin-1')
-
-                # Normalización de Columnas
-                if item['type'] == 'rahul':
-                    # Filtrar solo fútbol
+                # Estandarizar columnas a: Stadium, City, Country, Capacity
+                if source['type'] == 'rahul':
                     if 'sport_played' in df.columns:
                         df = df[df['sport_played'].str.contains('Football|Soccer', case=False, na=False)]
-                    
-                    df = df.rename(columns={
-                        'stadium_name': 'Stadium', 'location': 'City', 
-                        'country': 'Country', 'total_capacity': 'Capacity'
-                    })
-                    df = df[['Stadium', 'City', 'Country', 'Capacity']]
-
-                elif item['type'] in ['imtk', 'antimoni']:
-                    # Estos ya vienen con nombres parecidos
-                    df = df[['Stadium', 'City', 'Country', 'Capacity']]
-
-                # Limpieza de Capacidad (quitar comas y convertir a número)
-                df['Capacity'] = df['Capacity'].astype(str).str.replace(',', '').str.extract('(\d+)')[0]
+                    df = df.rename(columns={'stadium_name': 'Stadium', 'location': 'City', 'country': 'Country', 'total_capacity': 'Capacity'})
+                
+                # Seleccionar solo columnas clave
+                df = df[['Stadium', 'City', 'Country', 'Capacity']].copy()
+                
+                # Limpiar Capacidad (quitar comas)
+                df['Capacity'] = df['Capacity'].astype(str).str.replace(',', '').str.extract(r'(\d+)')[0]
                 df['Capacity'] = pd.to_numeric(df['Capacity'], errors='coerce').fillna(0).astype(int)
-
+                
                 dfs.append(df)
-            
             except Exception as e:
-                print(f"⚠️ No se pudo procesar {item['key']}: {e}")
-                # Continuamos con los que sí pudimos leer
+                print(f"⚠️ Saltando {source['key']} por error: {e}")
 
         if not dfs:
-            return {"statusCode": 500, "body": "No se pudieron cargar datasets."}
+            return {"statusCode": 500, "body": "No hay datos para procesar."}
 
-        # 3. Unificar (Merge)
+        # 3. Fusión y Deduplicación
         full_df = pd.concat(dfs, ignore_index=True)
-        print(f"📊 Total estadios crudos: {len(full_df)}")
+        print(f"📊 Total bruto: {len(full_df)}")
+        
+        # Crear columnas temporales normalizadas para identificar duplicados reales
+        full_df['norm_stadium'] = full_df['Stadium'].apply(normalize_text)
+        full_df['norm_city'] = full_df['City'].apply(normalize_text)
+        
+        # Eliminar duplicados basados en nombre y ciudad normalizados
+        full_df = full_df.drop_duplicates(subset=['norm_stadium', 'norm_city'])
+        print(f"📉 Tras eliminar duplicados: {len(full_df)}")
+        
+        # 4. Filtro FIFA (>40k)
+        candidates_df = full_df[full_df['Capacity'] >= 40000].copy()
+        # Limpiar columnas temp
+        candidates_df = candidates_df.drop(columns=['norm_stadium', 'norm_city'])
+        print(f"🏆 Candidatos finales (>40k): {len(candidates_df)}")
 
-        # Eliminar duplicados exactos (mismo nombre y ciudad)
-        full_df.drop_duplicates(subset=['Stadium', 'City'], keep='first', inplace=True)
+        # 5. Geocodificación con "Salvavidas" (Time-Aware)
+        geolocator = Nominatim(user_agent="wc_analyser_v2")
+        lats, lons = [], []
         
-        # 4. FILTRO FIFA: Capacidad >= 40,000
-        # Requisito oficial: 40k (fase grupos), 60k (semis), 80k (final)
-        FIFA_MIN_CAPACITY = 40000
-        
-        candidates_df = full_df[full_df['Capacity'] >= FIFA_MIN_CAPACITY].copy()
-        print(f"🏆 Estadios candidatos (>40k): {len(candidates_df)} (de {len(full_df)} originales)")
-
-        # 5. Geocodificación (Solo a los candidatos para ahorrar tiempo)
-        print("🌍 Buscando coordenadas (esto puede tardar unos minutos)...")
-        geolocator = Nominatim(user_agent="my_world_cup_analyser_v1")
-        
-        # Iteramos y aplicamos geocoding con pausa pequeña
-        lats = []
-        lons = []
+        print("🌍 Buscando coordenadas...")
+        processed_count = 0
         
         for index, row in candidates_df.iterrows():
+            # VERIFICACIÓN DE TIEMPO RESTANTE
+            # Si quedan menos de 20 segundos (20000 ms), paramos para guardar
+            remaining_ms = context.get_remaining_time_in_millis()
+            if remaining_ms < 20000:
+                print(f"⚠️ TIEMPO AGOTADO ({remaining_ms}ms restantes). Guardando progreso parcial...")
+                lats.extend([None] * (len(candidates_df) - len(lats)))
+                lons.extend([None] * (len(candidates_df) - len(lons)))
+                break
+
             lat, lon = get_coordinates(row['Stadium'], row['City'], row['Country'], geolocator)
             lats.append(lat)
             lons.append(lon)
-            # Pausa de seguridad para no saturar la API
-            time.sleep(1.1) 
             
-            if index % 10 == 0:
-                print(f"   ... procesados {index + 1} estadios")
+            processed_count += 1
+            if processed_count % 10 == 0:
+                print(f"   ... {processed_count} procesados")
+            
+            time.sleep(1.1) # Respetar API
 
         candidates_df['Latitude'] = lats
         candidates_df['Longitude'] = lons
-        
-        # Filtrar los que no encontramos coordenadas (opcional)
-        candidates_df.dropna(subset=['Latitude', 'Longitude'], inplace=True)
 
-        # 6. Guardar Resultado Final
+        # 6. Guardar (Parquet y CSV)
+        # Filtramos los que no tienen coordenadas para el dataset final limpio
+        final_df = candidates_df.dropna(subset=['Latitude'])
+        
         clean_key = "clean/world_cup_candidates.parquet"
-        
-        # Guardamos en Parquet (mejor rendimiento)
         parquet_buffer = io.BytesIO()
-        candidates_df.to_parquet(parquet_buffer, index=False)
+        final_df.to_parquet(parquet_buffer, index=False)
         s3_client.put_object(Bucket=S3_BUCKET, Key=clean_key, Body=parquet_buffer.getvalue())
-
-        # Guardamos también un CSV para que puedas verlo fácil
-        csv_key = "clean/world_cup_candidates.csv"
-        csv_buffer = io.StringIO()
-        candidates_df.to_csv(csv_buffer, index=False)
-        s3_client.put_object(Bucket=S3_BUCKET, Key=csv_key, Body=csv_buffer.getvalue().encode('utf-8'))
-
-        print(f"✅ ANÁLISIS COMPLETADO. Archivo guardado en: {clean_key}")
         
-        return {
-            "statusCode": 200, 
-            "body": f"Procesamiento exitoso. {len(candidates_df)} candidatos encontrados."
-        }
-
+        print(f"✅ Guardado exitoso: {clean_key} ({len(final_df)} estadios con coordenadas)")
+        return {"statusCode": 200, "body": "Proceso completado"}
+        
     except Exception as e:
-        print(f"❌ Error CRÍTICO en Cleaner: {str(e)}")
+        print(f"❌ Error Fatal: {str(e)}")
         raise e
