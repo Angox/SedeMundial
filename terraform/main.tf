@@ -176,7 +176,7 @@ resource "aws_lambda_function" "cleaner" {
   role          = aws_iam_role.lambda_role.arn
   package_type  = "Image"
   image_uri     = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
-  timeout       = 300
+  timeout       = 900
   memory_size   = 1024
   
   # AGREGAR ESTA LÍNEA
