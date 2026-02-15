@@ -356,4 +356,6 @@ def cleaner_handler(event, context):
         
         return {"statusCode": 200, "body": "OK. Pipeline Finalizado."}
 
-    except Exception as
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        raise e
