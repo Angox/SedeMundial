@@ -1,7 +1,7 @@
 import os
 
 # --- CONFIGURACIÓN CRÍTICA PARA LAMBDA ---
-# Forzamos todo a /tmp
+# Forzamos todo a /tmp para evitar errores de permisos de escritura
 os.environ['HOME'] = '/tmp'
 os.environ['KAGGLEHUB_CACHE'] = '/tmp'
 os.environ['XDG_CACHE_HOME'] = '/tmp'
@@ -15,131 +15,116 @@ import glob
 import shutil
 import time
 import unicodedata
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut
+import concurrent.futures # IMPORTANTE: Para ejecución en paralelo
+
+# Inicializamos clientes fuera de los handlers para reutilizar conexiones
+s3_client = boto3.client('s3')
+location_client = boto3.client('location')
 
 S3_BUCKET = os.environ['S3_BUCKET_NAME']
-s3_client = boto3.client('s3')
 
 # Configuración precisa por dataset
-# format: "kaggle_handle": {"s3_folder": "nombre_carpeta", "file_filter": "nombre_archivo_exacto_o_None"}
 DATASETS_CONFIG = {
     "rahuldabholkar/world-of-stadiums": {
         "s3_folder": "rahuldabholkar_world-of-stadiums",
-        "file_filter": "all_stadiums.csv" # Solo queremos este archivo
+        "file_filter": "all_stadiums.csv"
     },
     "imtkaggleteam/football-stadiums": {
         "s3_folder": "imtkaggleteam_football-stadiums",
-        "file_filter": None # Queremos todo (solo trae uno)
+        "file_filter": None
     },
     "antimoni/football-stadiums": {
         "s3_folder": "antimoni_football-stadiums",
-        "file_filter": None # Queremos todo
+        "file_filter": None
     }
 }
+
+# ==========================================
+# FUNCIONES DE INGESTA (EXTRACCIÓN)
+# ==========================================
 
 def analyze_file(local_file):
     """Intenta leer el CSV para imprimir info, probando varias codificaciones."""
     if not local_file.endswith('.csv'):
         return
 
-    # Lista de encodings para probar (utf-8 falla con caracteres raros de estadios europeos/latinos)
     encodings = ['utf-8', 'latin-1', 'cp1252', 'ISO-8859-1']
     
     for enc in encodings:
         try:
-            # Leemos solo 3 filas para ser rápidos y no gastar memoria
             df_temp = pd.read_csv(local_file, encoding=enc, nrows=3)
             print(f"   📊 [INSPECCIÓN - {enc}] Cols: {len(df_temp.columns)} | Ej: {df_temp.columns.tolist()}")
-            return # Éxito, salimos
+            return
         except UnicodeDecodeError:
-            continue # Probamos el siguiente encoding
+            continue
         except Exception as e:
             print(f"   ⚠️ No se pudo leer el CSV: {e}")
             return
-
     print("   ❌ Fallaron todos los intentos de lectura (encoding desconocido).")
 
 def upload_directory_to_s3(local_path, s3_folder_name, specific_file=None):
-    """Sube archivos recursivamente, respetando filtros y evitando colisiones."""
+    """Sube archivos recursivamente, respetando filtros."""
     files = glob.glob(f"{local_path}/**", recursive=True)
     
     for local_file in files:
         if os.path.isfile(local_file):
             filename = os.path.basename(local_file)
             
-            # --- FILTRADO ---
-            # Si hay filtro definido y el archivo no coincide, lo saltamos
             if specific_file and filename != specific_file:
-                # print(f"   ⏭️ Saltando archivo no deseado: {filename}")
                 continue
             
-            # --- INSPECCIÓN ---
             print(f"--- 📄 Procesando: {filename} ---")
             analyze_file(local_file)
             
-            # --- SUBIDA ---
-            # Estructura: raw / nombre_dataset_unico / archivo.csv
             s3_key = f"raw/{s3_folder_name}/{filename}"
             print(f"   📤 Subiendo a: s3://{S3_BUCKET}/{s3_key}")
             s3_client.upload_file(local_file, S3_BUCKET, s3_key)
 
 def handler(event, context):
+    """Función Lambda para INGESTA (Descarga de Kaggle -> S3)"""
     try:
         print(f"🚀 Iniciando Ingesta Controlada...")
         
-        # Limpiar /tmp para asegurar espacio si se reusa la lambda
         if os.path.exists("/tmp/datasets"):
             shutil.rmtree("/tmp/datasets", ignore_errors=True)
 
         for dataset_handle, config in DATASETS_CONFIG.items():
             print(f"\n⬇️ Descargando: {dataset_handle}...")
-            
             try:
                 path = kagglehub.dataset_download(dataset_handle)
-                
                 upload_directory_to_s3(
                     local_path=path, 
                     s3_folder_name=config['s3_folder'], 
                     specific_file=config['file_filter']
                 )
-                
             except Exception as e:
                 print(f"❌ Error descargando {dataset_handle}: {e}")
-                # No lanzamos raise aquí para que intente descargar los otros si uno falla
                 continue
             
         return {"statusCode": 200, "body": "Ingesta Selectiva Completada"}
         
     except Exception as e:
-        print(f"❌ ERROR CRÍTICO: {str(e)}")
+        print(f"❌ ERROR CRÍTICO INGESTA: {str(e)}")
         raise e
 
-# --- LÓGICA DE PROCESAMIENTO Y ANÁLISIS FIFA ---
-
-# --- NUEVA LÓGICA DE PROCESAMIENTO (ETL) ---
+# ==========================================
+# FUNCIONES DE PROCESAMIENTO (ETL & GEO)
+# ==========================================
 
 def read_csv_from_s3_robust(bucket, key):
-    """
-    Intenta leer un CSV de S3 reiniciando el stream cada vez.
-    Si todo falla, fuerza la lectura reemplazando caracteres ilegibles.
-    """
-    # Lista de codificaciones comunes + utf-8-sig (para BOM)
+    """Lectura robusta de CSV desde S3 probando encodings."""
     encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'windows-1250', 'ISO-8859-1']
     
     for encoding in encodings:
         try:
-            # IMPORTANTE: Hay que volver a pedir el objeto a S3 en cada intento
-            # porque el 'Body' es un stream que se consume al leerlo.
             obj = s3_client.get_object(Bucket=bucket, Key=key)
             return pd.read_csv(obj['Body'], encoding=encoding)
         except UnicodeDecodeError:
-            continue # Probamos el siguiente
+            continue
         except Exception as e:
             print(f"   ⚠️ Error leyendo {key} con {encoding}: {e}")
             continue
 
-    # ÚLTIMO RECURSO: Leer ignorando errores (caracteres raros serán '?')
     print(f"   ⚠️ Advertencia: Forzando lectura de {key} con reemplazo de caracteres.")
     obj = s3_client.get_object(Bucket=bucket, Key=key)
     return pd.read_csv(obj['Body'], encoding='utf-8', encoding_errors='replace')
@@ -148,28 +133,57 @@ def normalize_text(text):
     """Normaliza texto para comparaciones (minusculas, sin acentos)."""
     if pd.isna(text): return ""
     text = str(text).lower().strip()
-    text = unicodedata.normalize('NFD', text).encode('ascii', 'ignore').decode("utf-8")
-    return text
+    return unicodedata.normalize('NFD', text).encode('ascii', 'ignore').decode("utf-8")
 
-def get_coordinates(stadium, city, country, geolocator):
-    """Obtiene coordenadas con manejo de errores."""
-    query = f"{stadium}, {city}, {country}"
+def get_coordinates_aws(stadium, city, country, index_name):
+    """
+    Obtiene coordenadas usando AWS Location Service.
+    Es mucho más rápido y no requiere sleeps.
+    """
+    text = f"{stadium}, {city}, {country}"
+    
     try:
-        location = geolocator.geocode(query, timeout=10)
-        if location:
-            return location.latitude, location.longitude
-        # Reintento solo con ciudad
-        location = geolocator.geocode(f"{city}, {country}", timeout=10)
-        if location:
-            return location.latitude, location.longitude
-    except:
+        # Intento 1: Búsqueda precisa
+        response = location_client.search_place_index_for_text(
+            IndexName=index_name,
+            Text=text,
+            MaxResults=1
+        )
+        
+        if response['Results']:
+            point = response['Results'][0]['Place']['Geometry']['Point']
+            # AWS devuelve [Longitud, Latitud], nosotros queremos Lat, Lon
+            return point[1], point[0]
+            
+        # Intento 2: Solo Ciudad y País (Fallback)
+        fallback_text = f"{city}, {country}"
+        response = location_client.search_place_index_for_text(
+            IndexName=index_name,
+            Text=fallback_text,
+            MaxResults=1
+        )
+        
+        if response['Results']:
+            point = response['Results'][0]['Place']['Geometry']['Point']
+            return point[1], point[0]
+            
+    except Exception as e:
+        print(f"   ⚠️ Error geolocalizando '{text}': {e}")
         pass
+        
     return None, None
 
 def cleaner_handler(event, context):
+    """Función Lambda para LIMPIEZA y GEOLOCALIZACIÓN"""
     try:
-        print("⚽ Iniciando Procesamiento (Lectura Robusta + Filtro FIFA)...")
+        print("⚽ Iniciando Procesamiento (Lectura Robusta + AWS Location Service)...")
         
+        # Recuperamos el nombre del índice desde variables de entorno (Terraform)
+        place_index_name = os.environ.get('PLACE_INDEX')
+        if not place_index_name:
+            # Fallback por si acaso no se pasó la variable, aunque debería fallar
+            place_index_name = "stadiums-place-index" 
+
         sources = [
             {'key': 'raw/rahuldabholkar_world-of-stadiums/all_stadiums.csv', 'type': 'rahul'},
             {'key': 'raw/imtkaggleteam_football-stadiums/Football Stadiums.csv', 'type': 'imtk'},
@@ -178,7 +192,7 @@ def cleaner_handler(event, context):
 
         dfs = []
         
-        # 1. Carga (Con la nueva función robusta)
+        # 1. Carga
         for source in sources:
             try:
                 print(f"📖 Leyendo: {source['key']}...")
@@ -197,7 +211,6 @@ def cleaner_handler(event, context):
                 df['Capacity'] = pd.to_numeric(df['Capacity'], errors='coerce').fillna(0).astype(int)
                 
                 dfs.append(df)
-                print(f"   ✅ Leído correctamente: {len(df)} filas.")
             except Exception as e:
                 print(f"❌ Error fatal leyendo {source['key']}: {e}")
 
@@ -216,49 +229,57 @@ def cleaner_handler(event, context):
         
         # 3. FILTRO FIFA (>40k)
         candidates_df = full_df[full_df['Capacity'] >= 40000].copy()
-        candidates_df = candidates_df.drop(columns=['norm_stadium', 'norm_city']) # Limpieza final
+        candidates_df = candidates_df.drop(columns=['norm_stadium', 'norm_city'])
         
         count_candidates = len(candidates_df)
         print(f"🏆 Candidatos finales (>40k): {count_candidates}")
 
-        # 4. Geocodificación (Solo iteramos sobre candidates_df)
-        geolocator = Nominatim(user_agent="wc_analyser_v3")
-        lats, lons = [], []
+        # 4. Geocodificación PARALELA con AWS Location Service
+        print(f"🌍 Buscando coordenadas en paralelo usando '{place_index_name}'...")
         
-        print("🌍 Buscando coordenadas (solo para candidatos)...")
-        processed_count = 0
+        # Listas para almacenar resultados en orden
+        lats = [None] * count_candidates
+        lons = [None] * count_candidates
         
-        for index, row in candidates_df.iterrows():
-            # Salvavidas de tiempo (si quedan < 20s)
-            remaining_ms = context.get_remaining_time_in_millis()
-            if remaining_ms < 20000:
-                print(f"⚠️ TIEMPO AGOTADO. Guardando lo procesado hasta ahora...")
-                # Rellenar con None lo que falta para mantener longitud igual
-                remaining_rows = count_candidates - len(lats)
-                lats.extend([None] * remaining_rows)
-                lons.extend([None] * remaining_rows)
-                break
-
-            lat, lon = get_coordinates(row['Stadium'], row['City'], row['Country'], geolocator)
-            lats.append(lat)
-            lons.append(lon)
+        # Convertimos DataFrame a lista de diccionarios para iterar
+        rows = candidates_df.to_dict('records')
+        
+        # Usamos ThreadPoolExecutor para lanzar múltiples peticiones a la vez
+        # max_workers=10 permite hacer 10 búsquedas simultáneas
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # Enviamos todas las tareas
+            future_to_index = {
+                executor.submit(
+                    get_coordinates_aws, 
+                    row['Stadium'], 
+                    row['City'], 
+                    row['Country'], 
+                    place_index_name
+                ): i for i, row in enumerate(rows)
+            }
             
-            processed_count += 1
-            if processed_count % 10 == 0:
-                print(f"   ... procesados {processed_count} / {count_candidates}")
-            
-            time.sleep(1.1)
+            completed_count = 0
+            # Recogemos los resultados a medida que llegan
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    lat, lon = future.result()
+                    lats[index] = lat
+                    lons[index] = lon
+                except Exception as exc:
+                    print(f"   ⚠️ Excepción en worker {index}: {exc}")
+                
+                completed_count += 1
+                if completed_count % 20 == 0:
+                    print(f"   ... procesados {completed_count}/{count_candidates}")
 
         candidates_df['Latitude'] = lats
         candidates_df['Longitude'] = lons
 
         # 5. Guardar (Parquet y CSV)
-        # Filtramos los que no tienen coordenadas para el dataset final
         final_df = candidates_df.dropna(subset=['Latitude'])
         
         clean_key = "clean/world_cup_candidates.parquet"
-        
-        # --- AQUÍ SE GUARDA EL PARQUET ---
         parquet_buffer = io.BytesIO()
         final_df.to_parquet(parquet_buffer, index=False)
         s3_client.put_object(Bucket=S3_BUCKET, Key=clean_key, Body=parquet_buffer.getvalue())
@@ -266,7 +287,7 @@ def cleaner_handler(event, context):
         print(f"✅ ANÁLISIS COMPLETADO. Parquet guardado en: s3://{S3_BUCKET}/{clean_key}")
         print(f"   Estadios finales geolocalizados: {len(final_df)}")
 
-        return {"statusCode": 200, "body": f"Proceso OK. {len(final_df)} candidatos."}
+        return {"statusCode": 200, "body": f"Proceso OK. {len(final_df)} candidatos geolocalizados."}
         
     except Exception as e:
         print(f"❌ Error Fatal: {str(e)}")
