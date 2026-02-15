@@ -1,4 +1,12 @@
 import os
+
+# --- 🛠️ CORRECCIÓN CRÍTICA PARA LAMBDA ---
+# Forzamos a que TODO se guarde en /tmp (el único lugar con permisos de escritura)
+os.environ['HOME'] = '/tmp'             # Engaña a librerías que buscan en ~/
+os.environ['KAGGLEHUB_CACHE'] = '/tmp'  # Obliga a kagglehub a descargar aquí
+os.environ['XDG_CACHE_HOME'] = '/tmp'   # Estándar para caché de otras libs
+# -----------------------------------------
+
 import boto3
 import kagglehub
 import pandas as pd
