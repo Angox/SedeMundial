@@ -49,42 +49,78 @@ resource "aws_route_table_association" "public_assoc" {
 }
 
 # ==========================================
-# 2. IAM - Usuarios y Grupos (Dev Team)
+# 2. IAM - Gestión de Usuarios y Permisos
 # ==========================================
 
-resource "aws_iam_group" "developers" {
-  name = "stadiums-dev-team"
+# 1. Creamos el grupo para tus compañeros
+resource "aws_iam_group" "data_engineers" {
+  name = "data-engineers-group"
 }
 
-resource "aws_iam_group_policy_attachment" "dev_access" {
-  group      = aws_iam_group.developers.name
-  policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
+# 2. Les damos permisos de ADMINISTRADOR (Libertad total)
+resource "aws_iam_group_policy_attachment" "admin_access" {
+  group      = aws_iam_group.data_engineers.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }
 
-resource "aws_iam_group_policy_attachment" "query_editor_access" {
-  group      = aws_iam_group.developers.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonRedshiftQueryEditorV2FullAccess"
+# 3. ¡EL TRUCO! Bloqueamos explícitamente ver el dinero/facturas
+resource "aws_iam_group_policy" "deny_billing" {
+  name  = "BlockBillingAccess"
+  group = aws_iam_group.data_engineers.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Deny",
+        Action = [
+          "aws-portal:*",       # Consola de facturación antigua
+          "billing:*",          # Servicio de facturación
+          "ce:*",               # Cost Explorer (Explorador de costos)
+          "cur:*",              # Reportes de uso
+          "budgets:*",          # Presupuestos
+          "payments:*",         # Pagos
+          "tax:*"               # Impuestos
+        ],
+        Resource = "*"
+      }
+    ]
+  })
 }
 
-resource "aws_iam_user" "member_1" {
-  name = "equipo-persona1"
+# 4. Creamos los usuarios (Sustituye los nombres 'juan' y 'ana' por los reales)
+resource "aws_iam_user" "partner_1" {
+  name          = "juan-ingeniero" # CAMBIAR NOMBRE
   force_destroy = true
 }
 
-resource "aws_iam_user_login_profile" "member_1_login" {
-  user    = aws_iam_user.member_1.name
-  pgp_key = "keybase:terraform"
-  lifecycle {
-    ignore_changes = [password_reset_required, password_length]
-  }
+resource "aws_iam_user" "partner_2" {
+  name          = "ana-ingeniera"  # CAMBIAR NOMBRE
+  force_destroy = true
 }
 
-resource "aws_iam_group_membership" "team" {
-  name = "team-membership"
-  users = [aws_iam_user.member_1.name]
-  group = aws_iam_group.developers.name
+# 5. Los añadimos al grupo
+resource "aws_iam_group_membership" "engineers_membership" {
+  name = "engineers-membership"
+  users = [
+    aws_iam_user.partner_1.name,
+    aws_iam_user.partner_2.name
+  ]
+  group = aws_iam_group.data_engineers.name
 }
 
+# 6. Generamos contraseñas de consola para ellos
+# IMPORTANTE: Esto creará una contraseña inicial que verás en el output
+resource "aws_iam_user_login_profile" "partner_1_login" {
+  user                    = aws_iam_user.partner_1.name
+  password_reset_required = true
+  # No usamos PGP para simplificarte la vida, la contraseña saldrá en el output de Terraform
+}
+
+resource "aws_iam_user_login_profile" "partner_2_login" {
+  user                    = aws_iam_user.partner_2.name
+  password_reset_required = true
+}
 # ==========================================
 # 3. Storage & Docker
 # ==========================================
@@ -385,4 +421,14 @@ output "redshift_host" {
 
 output "redshift_workgroup_name" {
   value = aws_redshiftserverless_workgroup.stadiums.workgroup_name
+}
+
+output "partner_1_password" {
+  value = aws_iam_user_login_profile.partner_1_login.password
+  sensitive = false # Para que te la muestre en consola
+}
+
+output "partner_2_password" {
+  value = aws_iam_user_login_profile.partner_2_login.password
+  sensitive = false
 }
