@@ -3,13 +3,13 @@ variable "kaggle_key" {}
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
-# Obtenemos las zonas disponibles (us-east-1a, us-east-1b, etc.)
+# Obtenemos las zonas disponibles para alta disponibilidad (Redshift lo prefiere)
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
 # ==========================================
-# 1. Red y VPC (CORREGIDO PARA MULTI-AZ)
+# 1. Red y VPC (Multi-AZ)
 # ==========================================
 
 resource "aws_vpc" "main" {
@@ -31,19 +31,17 @@ resource "aws_route_table" "public_rt" {
   }
 }
 
-# --- CAMBIO IMPORTANTE: Crear 3 Subnets en 3 Zonas distintas ---
+# Creamos 3 Subnets en 3 Zonas distintas para Redshift Serverless
 resource "aws_subnet" "public" {
-  count                   = 3 # Creamos 3 subredes
+  count                   = 3
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.${count.index + 1}.0/24" # 10.0.1.0, 10.0.2.0, 10.0.3.0
   map_public_ip_on_launch = true
-  # Asigna cada subnet a una zona diferente (a, b, c)
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   
   tags = { Name = "stadiums-public-subnet-${count.index}" }
 }
 
-# Asociar las 3 subredes a la tabla de rutas
 resource "aws_route_table_association" "public_assoc" {
   count          = 3
   subnet_id      = aws_subnet.public[count.index].id
@@ -51,7 +49,7 @@ resource "aws_route_table_association" "public_assoc" {
 }
 
 # ==========================================
-# 2. IAM - Equipo y Consola
+# 2. IAM - Usuarios y Grupos (Dev Team)
 # ==========================================
 
 resource "aws_iam_group" "developers" {
@@ -83,7 +81,7 @@ resource "aws_iam_group_membership" "team" {
 }
 
 # ==========================================
-# 3. Storage & Docker (CORREGIDO RUTA)
+# 3. Storage & Docker
 # ==========================================
 
 resource "aws_s3_bucket" "data_lake" {
@@ -103,20 +101,16 @@ resource "null_resource" "build_docker" {
       # 1. Login
       aws ecr get-login-password --region ${data.aws_region.current.name} | docker login --username AWS --password-stdin ${data.aws_caller_identity.current.account_id}.dkr.ecr.${data.aws_region.current.name}.amazonaws.com
       
-      # 2. Intentar borrar la imagen antigua para evitar conflictos de manifiesto (si falla no importa)
+      # 2. Limpieza (opcional)
       aws ecr batch-delete-image --repository-name stadiums-ingestor --image-ids imageTag=latest || true
       
-      # 3. Construir usando el modo LEGACY (DOCKER_BUILDKIT=0)
-      # Esto garantiza formato Docker V2 Schema 2 compatible con Lambda
+      # 3. Build & Push (AMD64 para Lambda estándar)
       export DOCKER_BUILDKIT=0
       docker build --platform linux/amd64 -t ${aws_ecr_repository.lambda_repo.repository_url}:latest ../src/lambda
-      
-      # 4. Subir
       docker push ${aws_ecr_repository.lambda_repo.repository_url}:latest
     EOF
   }
   
-  # Cambiamos el trigger para forzar que se ejecute siempre
   triggers = {
     always_run = timestamp()
   }
@@ -125,7 +119,7 @@ resource "null_resource" "build_docker" {
 }
 
 # ==========================================
-# 4. Lambdas
+# 4. Configuración de IAM para Lambdas
 # ==========================================
 
 resource "aws_iam_role" "lambda_role" {
@@ -136,6 +130,7 @@ resource "aws_iam_role" "lambda_role" {
   })
 }
 
+# Permisos Básicos + S3
 resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
@@ -146,85 +141,55 @@ resource "aws_iam_role_policy_attachment" "lambda_s3_full" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
 }
 
-resource "aws_lambda_function" "ingestor" {
-  function_name = "stadiums-ingestor"
-  role          = aws_iam_role.lambda_role.arn
-  package_type  = "Image"
-  image_uri     = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
-  timeout       = 600
-  memory_size   = 2048
-  
-  # AGREGAR ESTA LÍNEA
-  architectures = ["x86_64"]
-  
-  image_config {
-    command = ["main.handler"]
-  }
+# --- NUEVO: Permiso para usar Redshift Data API ---
+resource "aws_iam_policy" "lambda_redshift_data_policy" {
+  name        = "lambda-redshift-data-access"
+  description = "Permite a Lambda ejecutar SQL en Redshift Serverless via API"
 
-  environment {
-    variables = {
-      S3_BUCKET_NAME = aws_s3_bucket.data_lake.bucket
-      KAGGLE_USERNAME = var.kaggle_username
-      KAGGLE_KEY      = var.kaggle_key
-    }
-  }
-  depends_on = [null_resource.build_docker]
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = [
+          "redshift-data:ExecuteStatement",
+          "redshift-data:GetStatementResult",
+          "redshift-data:DescribeStatement",
+          "redshift-data:ListStatements",
+          "redshift-data:BatchExecuteStatement"
+        ]
+        Resource = "*" # Data API no siempre soporta resource restrictions granulares fácilmente
+      }
+    ]
+  })
 }
 
-resource "aws_lambda_function" "cleaner" {
-  function_name = "stadiums-cleaner-etl"
-  role          = aws_iam_role.lambda_role.arn
-  package_type  = "Image"
-  image_uri     = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
-  timeout       = 900
-  memory_size   = 1024
-  
-  # AGREGAR ESTA LÍNEA
-  architectures = ["x86_64"]
-  
-  image_config {
-    command = ["main.cleaner_handler"]
-  }
-
-  environment {
-    variables = {
-      S3_BUCKET_NAME = aws_s3_bucket.data_lake.bucket
-      # Añadimos el nombre del índice
-      PLACE_INDEX    = aws_location_place_index.main.index_name 
-    }
-  }
-  depends_on = [null_resource.build_docker]
-}
-
-resource "aws_lambda_permission" "allow_s3" {
-  statement_id  = "AllowExecutionFromS3"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.cleaner.function_name
-  principal     = "s3.amazonaws.com"
-  source_arn    = aws_s3_bucket.data_lake.arn
-}
-
-resource "aws_s3_bucket_notification" "bucket_notification" {
-  bucket = aws_s3_bucket.data_lake.id
-
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.cleaner.arn
-    events              = ["s3:ObjectCreated:*"]
-    
-    # --- CAMBIO AQUÍ ---
-    # Antes: "raw/"
-    # Ahora: Apuntamos solo a la carpeta del ÚLTIMO dataset que sube tu script Python.
-    filter_prefix       = "raw/antimoni_football-stadiums/"
-    
-    filter_suffix       = ".csv"
-  }
-  
-  depends_on = [aws_lambda_permission.allow_s3]
+resource "aws_iam_role_policy_attachment" "lambda_redshift_attach" {
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = aws_iam_policy.lambda_redshift_data_policy.arn
 }
 
 # ==========================================
 # 5. Redshift Serverless
 # ==========================================
+
+# --- NUEVO: Rol para que Redshift pueda leer de S3 (COPY Command) ---
+resource "aws_iam_role" "redshift_s3_role" {
+  name = "redshift-s3-access-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "redshift.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "redshift_s3_attach" {
+  role       = aws_iam_role.redshift_s3_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+}
 
 resource "aws_security_group" "redshift_sg" {
   name        = "stadiums-redshift-sg"
@@ -250,6 +215,10 @@ resource "aws_redshiftserverless_namespace" "stadiums" {
   db_name             = "stadiumsdb"
   admin_username      = "adminuser"
   admin_user_password = "Password123Temp!"
+  
+  # Vinculamos el Rol S3 al Namespace
+  iam_roles = [aws_iam_role.redshift_s3_role.arn]
+  
   tags = { Env = "Dev" }
 }
 
@@ -258,27 +227,24 @@ resource "aws_redshiftserverless_workgroup" "stadiums" {
   namespace_name = aws_redshiftserverless_namespace.stadiums.namespace_name
   base_capacity  = 8 
   
-  # CAMBIO IMPORTANTE: Pasamos TODOS los IDs de las 3 subnets creadas
-  subnet_ids             = aws_subnet.public[*].id
-  security_group_ids     = [aws_security_group.redshift_sg.id]
-  publicly_accessible    = true
+  subnet_ids         = aws_subnet.public[*].id
+  security_group_ids = [aws_security_group.redshift_sg.id]
+  publicly_accessible = true
 }
 
 # ==========================================
-# 7. AWS Location Service (Geocoding)
+# 6. AWS Location Service (Geocoding)
 # ==========================================
 
 resource "aws_location_place_index" "main" {
   index_name  = "stadiums-place-index"
-  data_source = "Esri" # O "Here", ambos son excelentes proveedores
+  data_source = "Esri"
   description = "Indice para geolocalizar estadios"
 }
 
-# Actualizar permisos de la Lambda Cleaner
 resource "aws_iam_policy" "location_policy" {
   name        = "stadiums-location-policy"
   description = "Permite a la lambda buscar lugares"
-
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -297,7 +263,106 @@ resource "aws_iam_role_policy_attachment" "lambda_location_attach" {
 }
 
 # ==========================================
-# 6. Outputs
+# 7. Funciones Lambda
+# ==========================================
+
+resource "aws_lambda_function" "ingestor" {
+  function_name = "stadiums-ingestor"
+  role          = aws_iam_role.lambda_role.arn
+  package_type  = "Image"
+  image_uri     = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
+  timeout       = 600
+  memory_size   = 2048
+  architectures = ["x86_64"]
+  
+  image_config {
+    command = ["main.handler"]
+  }
+
+  environment {
+    variables = {
+      S3_BUCKET_NAME  = aws_s3_bucket.data_lake.bucket
+      KAGGLE_USERNAME = var.kaggle_username
+      KAGGLE_KEY      = var.kaggle_key
+    }
+  }
+  depends_on = [null_resource.build_docker]
+}
+
+resource "aws_lambda_function" "cleaner" {
+  function_name = "stadiums-cleaner-etl"
+  role          = aws_iam_role.lambda_role.arn
+  package_type  = "Image"
+  image_uri     = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
+  timeout       = 900
+  memory_size   = 1024
+  architectures = ["x86_64"]
+  
+  image_config {
+    command = ["main.cleaner_handler"]
+  }
+
+  environment {
+    variables = {
+      S3_BUCKET_NAME    = aws_s3_bucket.data_lake.bucket
+      PLACE_INDEX       = aws_location_place_index.main.index_name
+      # --- NUEVO: Variables para conexión a Redshift ---
+      REDSHIFT_WG_NAME  = aws_redshiftserverless_workgroup.stadiums.workgroup_name
+      REDSHIFT_DB       = aws_redshiftserverless_namespace.stadiums.db_name
+      REDSHIFT_ROLE_ARN = aws_iam_role.redshift_s3_role.arn
+    }
+  }
+  depends_on = [null_resource.build_docker]
+}
+
+# Trigger de S3 para Cleaner
+resource "aws_lambda_permission" "allow_s3" {
+  statement_id  = "AllowExecutionFromS3"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.cleaner.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.data_lake.arn
+}
+
+resource "aws_s3_bucket_notification" "bucket_notification" {
+  bucket = aws_s3_bucket.data_lake.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.cleaner.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "raw/antimoni_football-stadiums/"
+    filter_suffix       = ".csv"
+  }
+  
+  depends_on = [aws_lambda_permission.allow_s3]
+}
+
+# ==========================================
+# 8. Trigger Mensual (EventBridge)
+# ==========================================
+
+resource "aws_cloudwatch_event_rule" "monthly_trigger" {
+  name                = "stadiums-monthly-ingest"
+  description         = "Dispara la ingesta de estadios el dia 1 de cada mes"
+  schedule_expression = "cron(0 0 1 * ? *)"
+}
+
+resource "aws_cloudwatch_event_target" "trigger_ingestor_lambda" {
+  rule      = aws_cloudwatch_event_rule.monthly_trigger.name
+  target_id = "TriggerIngestorLambda"
+  arn       = aws_lambda_function.ingestor.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ingestor.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.monthly_trigger.arn
+}
+
+# ==========================================
+# 9. Outputs
 # ==========================================
 
 output "bucket_name" { 
@@ -312,33 +377,6 @@ output "redshift_host" {
   value = aws_redshiftserverless_workgroup.stadiums.endpoint[0].address
 }
 
-
-# ==========================================
-# TRIGGER MENSUAL (EventBridge)
-# ==========================================
-
-# 1. La Regla: Define CUÁNDO se ejecuta
-resource "aws_cloudwatch_event_rule" "monthly_trigger" {
-  name        = "stadiums-monthly-ingest"
-  description = "Dispara la ingesta de estadios el dia 1 de cada mes"
-  
-  # Sintaxis Cron: Minuto Hora DiaMes Mes DiaSemana Año
-  # Esto se ejecuta a las 00:00 UTC del día 1 de cada mes
-  schedule_expression = "cron(0 0 1 * ? *)"
-}
-
-# 2. El Objetivo: Define QUÉ se ejecuta (Tu Lambda)
-resource "aws_cloudwatch_event_target" "trigger_ingestor_lambda" {
-  rule      = aws_cloudwatch_event_rule.monthly_trigger.name
-  target_id = "TriggerIngestorLambda"
-  arn       = aws_lambda_function.ingestor.arn
-}
-
-# 3. El Permiso: Autoriza a EventBridge a invocar tu Lambda
-resource "aws_lambda_permission" "allow_eventbridge" {
-  statement_id  = "AllowExecutionFromEventBridge"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.ingestor.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.monthly_trigger.arn
+output "redshift_workgroup_name" {
+  value = aws_redshiftserverless_workgroup.stadiums.workgroup_name
 }
