@@ -17,12 +17,10 @@ import unicodedata
 import concurrent.futures
 import math
 
-# Inicializar cliente de Redshift Data
-redshift_data_client = boto3.client('redshift-data')
-
 # Inicializamos clientes
 s3_client = boto3.client('s3')
 location_client = boto3.client('location')
+redshift_data_client = boto3.client('redshift-data') # Cliente nuevo para Redshift
 
 S3_BUCKET = os.environ['S3_BUCKET_NAME']
 
@@ -42,7 +40,6 @@ DATASETS_CONFIG = {
     }
 }
 
-# Diccionario de corrección (Sigue siendo útil para la búsqueda inicial)
 COUNTRY_MAPPING = {
     'United States of America': 'United States',
     'USA': 'United States',
@@ -63,7 +60,7 @@ COUNTRY_MAPPING = {
 }
 
 # ==========================================
-# 1. FUNCIONES DE INGESTA
+# 1. FUNCIONES DE INGESTA (EXTRACCIÓN)
 # ==========================================
 
 def upload_directory_to_s3(local_path, s3_folder_name, specific_file=None):
@@ -128,36 +125,27 @@ def normalize_text(text):
     return text.strip()
 
 def get_coordinates_and_enrich(stadium, city, country, index_name):
-    """
-    Obtiene Coordenadas + ISO Country + Region + Dirección Oficial
-    Devuelve un diccionario con los datos enriquecidos.
-    """
     text = f"{stadium}, {city}, {country}"
     
-    # Función auxiliar para procesar la respuesta de AWS
     def extract_data(resp):
         if not resp['Results']: return None
-        
         place = resp['Results'][0]['Place']
-        point = place['Geometry']['Point'] # [Lon, Lat]
-        
+        point = place['Geometry']['Point']
         return {
             'lat': point[1],
             'lon': point[0],
-            'iso_country': place.get('Country', None), # Ej: "ESP", "USA"
-            'region': place.get('Region', None),       # Ej: "Madrid", "California"
-            'official_address': place.get('Label', None) # Ej: "Santiago Bernabéu, Av. Concha Espina..."
+            'iso_country': place.get('Country', None),
+            'region': place.get('Region', None),
+            'official_address': place.get('Label', None)
         }
 
     try:
-        # Intento 1: Búsqueda completa
         response = location_client.search_place_index_for_text(
             IndexName=index_name, Text=text, MaxResults=1
         )
         data = extract_data(response)
         if data: return data
             
-        # Intento 2: Fallback (Solo ciudad)
         response = location_client.search_place_index_for_text(
             IndexName=index_name, Text=f"{city}, {country}", MaxResults=1
         )
@@ -167,7 +155,6 @@ def get_coordinates_and_enrich(stadium, city, country, index_name):
     except Exception:
         pass
         
-    # Si todo falla, devolvemos vacíos
     return {'lat': None, 'lon': None, 'iso_country': None, 'region': None, 'official_address': None}
 
 def spatial_deduplication(df, distance_threshold_deg=0.003):
@@ -198,6 +185,69 @@ def spatial_deduplication(df, distance_threshold_deg=0.003):
             seen_coords.append((lat, lon))
             
     return df.loc[kept_indices].drop(columns=['name_score'])
+
+# ==========================================
+# 3. FUNCIONES DE CARGA A REDSHIFT
+# ==========================================
+
+def execute_redshift_query(sql_query):
+    """Ejecuta una query en Redshift Serverless via Data API"""
+    wg_name = os.environ['REDSHIFT_WG_NAME']
+    db_name = os.environ['REDSHIFT_DB']
+    
+    print(f"📡 Ejecutando SQL en Redshift: {sql_query[:100]}...")
+    
+    try:
+        response = redshift_data_client.execute_statement(
+            WorkgroupName=wg_name,
+            Database=db_name,
+            Sql=sql_query
+        )
+        return response['Id']
+    except Exception as e:
+        print(f"❌ Error ejecutando query Redshift: {e}")
+        raise e
+
+def load_parquet_to_redshift(s3_path):
+    iam_role = os.environ['REDSHIFT_ROLE_ARN']
+    table_name = "public.stadiums_clean"
+    
+    # 1. Crear Tabla si no existe (DDL)
+    ddl_sql = f"""
+    CREATE TABLE IF NOT EXISTS {table_name} (
+        stadium VARCHAR(255),
+        city VARCHAR(255),
+        country VARCHAR(255),
+        capacity INT,
+        latitude FLOAT,
+        longitude FLOAT,
+        iso_country VARCHAR(50),
+        region VARCHAR(100),
+        official_address VARCHAR(500)
+    );
+    """
+    execute_redshift_query(ddl_sql)
+    
+    # 2. Limpiar tabla anterior (TRUNCATE)
+    # Esperamos 2 segundos para asegurar que el DDL anterior se procesó si fue la primera vez
+    time.sleep(2) 
+    truncate_sql = f"TRUNCATE TABLE {table_name};"
+    execute_redshift_query(truncate_sql)
+    
+    # 3. Comando COPY (S3 -> Redshift)
+    copy_sql = f"""
+    COPY {table_name}
+    FROM '{s3_path}'
+    IAM_ROLE '{iam_role}'
+    FORMAT AS PARQUET;
+    """
+    
+    query_id = execute_redshift_query(copy_sql)
+    return query_id
+
+# ==========================================
+# HANDLER PRINCIPAL (ETL + REDSHIFT)
+# ==========================================
 
 def cleaner_handler(event, context):
     try:
@@ -230,13 +280,12 @@ def cleaner_handler(event, context):
             except Exception as e:
                 print(f"⚠️ Error leyendo {src['key']}: {e}")
 
-        if not dfs: return {"statusCode": 500, "body": "No Data"}
+        if not dfs: return {"statusCode": 500, "body": "No Data found in S3"}
 
         # 2. Fusión y Pre-filtrado
         full_df = pd.concat(dfs, ignore_index=True)
         candidates = full_df[full_df['Capacity'] >= 40000].copy()
         
-        # Deduplicación preliminar
         candidates['norm_name'] = candidates['Stadium'].apply(normalize_text)
         candidates['norm_country'] = candidates['Country'].apply(normalize_text)
         candidates = candidates.drop_duplicates(subset=['norm_name', 'norm_country'])
@@ -262,7 +311,7 @@ def cleaner_handler(event, context):
                 try:
                     enriched_results[idx] = future.result()
                 except:
-                    enriched_results[idx] = {'lat': None, 'lon': None} # Fallback vacío
+                    enriched_results[idx] = {'lat': None, 'lon': None}
 
         # 4. Asignación de nuevas columnas enriquecidas
         candidates['Latitude'] = [r['lat'] for r in enriched_results]
@@ -274,93 +323,12 @@ def cleaner_handler(event, context):
         # Filtrar no encontrados
         candidates = candidates.dropna(subset=['Latitude'])
 
-        # 5. Deduplicación Geoespacial
+        # 5. Deduplicación Geoespacial -> AQUÍ SE CREA final_df
         final_df = spatial_deduplication(candidates)
         
         print(f"✅ Estadios finales enriquecidos: {len(final_df)}")
 
-        # 6. Guardar
-        clean_key = "clean/world_cup_candidates.parquet"
-        buf = io.BytesIO()
-        final_df.to_parquet(buf, index=False)
-        s3_client.put_object(Bucket=S3_BUCKET, Key=clean_key, Body=buf.getvalue())
-        
-        return {"statusCode": 200, "body": f"OK. {len(final_df)} estadios enriquecidos."}
-
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        raise e
-
-
-# ==========================================
-# 3. FUNCIONES DE CARGA A REDSHIFT
-# ==========================================
-
-def execute_redshift_query(sql_query):
-    """Ejecuta una query en Redshift Serverless via Data API"""
-    wg_name = os.environ['REDSHIFT_WG_NAME']
-    db_name = os.environ['REDSHIFT_DB']
-    
-    print(f"📡 Ejecutando SQL en Redshift: {sql_query[:100]}...")
-    
-    try:
-        response = redshift_data_client.execute_statement(
-            WorkgroupName=wg_name,
-            Database=db_name,
-            Sql=sql_query
-        )
-        return response['Id']
-    except Exception as e:
-        print(f"❌ Error ejecutando query Redshift: {e}")
-        raise e
-
-def load_parquet_to_redshift(s3_path):
-    iam_role = os.environ['REDSHIFT_ROLE_ARN']
-    table_name = "public.stadiums_clean"
-    
-    # 1. Crear Tabla si no existe (DDL)
-    # Nota: Definimos las columnas basándonos en tu DataFrame final
-    ddl_sql = f"""
-    CREATE TABLE IF NOT EXISTS {table_name} (
-        stadium VARCHAR(255),
-        city VARCHAR(255),
-        country VARCHAR(255),
-        capacity INT,
-        latitude FLOAT,
-        longitude FLOAT,
-        iso_country VARCHAR(50),
-        region VARCHAR(100),
-        official_address VARCHAR(500)
-    );
-    """
-    execute_redshift_query(ddl_sql)
-    
-    # 2. Limpiar tabla anterior (Opcional: Si quieres reemplazo total)
-    truncate_sql = f"TRUNCATE TABLE {table_name};"
-    execute_redshift_query(truncate_sql)
-    
-    # 3. Comando COPY (La magia que mueve datos de S3 -> Redshift)
-    copy_sql = f"""
-    COPY {table_name}
-    FROM '{s3_path}'
-    IAM_ROLE '{iam_role}'
-    FORMAT AS PARQUET;
-    """
-    
-    query_id = execute_redshift_query(copy_sql)
-    return query_id
-
-# ==========================================
-# MODIFICACIÓN EN EL HANDLER PRINCIPAL
-# ==========================================
-
-def cleaner_handler(event, context):
-    try:
-        # ... (Tu lógica de ETL existente hasta el paso 5) ...
-        # ...
-        # print(f"✅ Estadios finales enriquecidos: {len(final_df)}")
-
-        # 6. Guardar en S3 (Esto ya lo tenías)
+        # 6. Guardar en S3 (Parquet)
         clean_key = "clean/world_cup_candidates.parquet"
         buf = io.BytesIO()
         final_df.to_parquet(buf, index=False)
@@ -369,7 +337,7 @@ def cleaner_handler(event, context):
         full_s3_path = f"s3://{S3_BUCKET}/{clean_key}"
         print(f"💾 Guardado en: {full_s3_path}")
 
-        # --- NUEVO: CARGA A REDSHIFT ---
+        # 7. CARGA A REDSHIFT
         print("🚀 Iniciando carga automática a Redshift...")
         query_id = load_parquet_to_redshift(full_s3_path)
         print(f"✅ Comando COPY enviado a Redshift. Query ID: {query_id}")
