@@ -257,6 +257,38 @@ resource "aws_redshiftserverless_workgroup" "stadiums" {
 }
 
 # ==========================================
+# 7. AWS Location Service (Geocoding)
+# ==========================================
+
+resource "aws_location_place_index" "main" {
+  index_name  = "stadiums-place-index"
+  data_source = "Esri" # O "Here", ambos son excelentes proveedores
+  description = "Indice para geolocalizar estadios"
+}
+
+# Actualizar permisos de la Lambda Cleaner
+resource "aws_iam_policy" "location_policy" {
+  name        = "stadiums-location-policy"
+  description = "Permite a la lambda buscar lugares"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "geo:SearchPlaceIndexForText"
+        Resource = aws_location_place_index.main.index_arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_location_attach" {
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = aws_iam_policy.location_policy.arn
+}
+
+# ==========================================
 # 6. Outputs
 # ==========================================
 
