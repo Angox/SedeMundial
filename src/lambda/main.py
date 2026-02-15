@@ -20,7 +20,7 @@ import math
 # Inicializamos clientes
 s3_client = boto3.client('s3')
 location_client = boto3.client('location')
-redshift_data_client = boto3.client('redshift-data') # Cliente nuevo para Redshift
+redshift_data_client = boto3.client('redshift-data')
 
 S3_BUCKET = os.environ['S3_BUCKET_NAME']
 
@@ -195,6 +195,7 @@ def execute_redshift_query(sql_query):
     wg_name = os.environ['REDSHIFT_WG_NAME']
     db_name = os.environ['REDSHIFT_DB']
     
+    # Imprimimos solo los primeros 100 caracteres para no ensuciar logs
     print(f"📡 Ejecutando SQL en Redshift: {sql_query[:100]}...")
     
     try:
@@ -212,13 +213,22 @@ def load_parquet_to_redshift(s3_path):
     iam_role = os.environ['REDSHIFT_ROLE_ARN']
     table_name = "public.stadiums_clean"
     
-    # 1. Crear Tabla si no existe (DDL)
+    # 1. BORRAR TABLA ANTERIOR (DROP)
+    # Esto evita problemas de compatibilidad si cambias columnas
+    drop_sql = f"DROP TABLE IF EXISTS {table_name};"
+    execute_redshift_query(drop_sql)
+    
+    # Esperamos un segundo para asegurar que el DROP se procese
+    time.sleep(1)
+
+    # 2. CREAR TABLA (DDL)
+    # IMPORTANTE: Los nombres de columnas aquí coinciden con el Parquet (minúsculas)
     ddl_sql = f"""
-    CREATE TABLE IF NOT EXISTS {table_name} (
+    CREATE TABLE {table_name} (
         stadium VARCHAR(255),
         city VARCHAR(255),
         country VARCHAR(255),
-        capacity INT,
+        capacity BIGINT,
         latitude FLOAT,
         longitude FLOAT,
         iso_country VARCHAR(50),
@@ -228,13 +238,7 @@ def load_parquet_to_redshift(s3_path):
     """
     execute_redshift_query(ddl_sql)
     
-    # 2. Limpiar tabla anterior (TRUNCATE)
-    # Esperamos 2 segundos para asegurar que el DDL anterior se procesó si fue la primera vez
-    time.sleep(2) 
-    truncate_sql = f"TRUNCATE TABLE {table_name};"
-    execute_redshift_query(truncate_sql)
-    
-    # 3. Comando COPY (S3 -> Redshift)
+    # 3. COMANDO COPY (S3 -> Redshift)
     copy_sql = f"""
     COPY {table_name}
     FROM '{s3_path}'
@@ -323,8 +327,13 @@ def cleaner_handler(event, context):
         # Filtrar no encontrados
         candidates = candidates.dropna(subset=['Latitude'])
 
-        # 5. Deduplicación Geoespacial -> AQUÍ SE CREA final_df
+        # 5. Deduplicación Geoespacial
         final_df = spatial_deduplication(candidates)
+        
+        # --- CORRECCIÓN CRÍTICA PARA REDSHIFT ---
+        # Redshift espera que los nombres en el Parquet coincidan con la tabla (case-sensitive)
+        # Convertimos todo a minúsculas: 'Stadium' -> 'stadium'
+        final_df.columns = final_df.columns.str.lower()
         
         print(f"✅ Estadios finales enriquecidos: {len(final_df)}")
 
