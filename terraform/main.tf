@@ -61,6 +61,11 @@ resource "aws_iam_group_policy_attachment" "dev_access" {
   policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
 }
 
+resource "aws_iam_group_policy_attachment" "query_editor_access" {
+  group      = aws_iam_group.developers.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonRedshiftQueryEditorV2FullAccess"
+}
+
 resource "aws_iam_user" "member_1" {
   name = "equipo-persona1"
   force_destroy = true
