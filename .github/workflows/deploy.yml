@@ -3,6 +3,8 @@ name: Deploy Data Pipeline
 on:
   push:
     branches: [ "main" ]
+  # Permite ejecutarlo manualmente también sin necesidad de hacer push
+  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -31,6 +33,7 @@ jobs:
         working-directory: ./terraform
 
       - name: Terraform Apply
+        # Se ejecuta apply. Si vienes de un destroy, esto crea toda la infra (S3, Redshift, Lambdas vacías)
         run: terraform apply -auto-approve -var="kaggle_username=${{ secrets.KAGGLE_USERNAME }}" -var="kaggle_key=${{ secrets.KAGGLE_KEY }}"
         working-directory: ./terraform
 
@@ -59,27 +62,48 @@ jobs:
           IMAGE_TAG: latest
         run: |
           cd src/lambda
-          # CORRECCIÓN AQUÍ:
-          # 1. --platform linux/amd64: Asegura compatibilidad con Lambda x86_64
-          # 2. --provenance=false: Evita el error "media type not supported" al desactivar las attestations
+          # Build compatible con Lambda (linux/amd64)
           docker build --platform linux/amd64 --provenance=false -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
       - name: Update Lambda Code
         run: |
-          # 1. Obtener el ID de la cuenta dinámicamente (Más seguro que usar secrets fijos)
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           REGION="us-east-1"
           ECR_URL="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/stadiums-ingestor:latest"
           
           echo "Usando imagen: $ECR_URL"
 
-          # 2. Actualizar Ingestor
+          # Actualizar Ingestor
           aws lambda update-function-code \
             --function-name stadiums-ingestor \
             --image-uri $ECR_URL
 
-          # 3. Actualizar Cleaner
+          # Actualizar Cleaner
           aws lambda update-function-code \
             --function-name stadiums-cleaner-etl \
             --image-uri $ECR_URL
+          
+          # Esperar unos segundos para asegurar que la actualización se propagó
+          sleep 10
+
+      # --- NUEVO PASO AÑADIDO ---
+      - name: Trigger Initial Ingestion
+        run: |
+          echo "🚀 Disparando Lambda de Ingesta para poblar datos iniciales..."
+          
+          # Invocamos la lambda sincrónicamente para ver si hay error en el log del CI/CD
+          aws lambda invoke \
+            --function-name stadiums-ingestor \
+            --payload '{}' \
+            --cli-binary-format raw-in-base64-out \
+            response.json
+
+          echo "✅ Respuesta de la Lambda:"
+          cat response.json
+          
+          # Opcional: Fallar el pipeline si la lambda devuelve error
+          if grep -q "FunctionError" response.json; then
+            echo "❌ La Lambda falló durante la ejecución."
+            exit 1
+          fi
