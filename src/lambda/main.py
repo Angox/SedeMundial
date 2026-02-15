@@ -39,7 +39,7 @@ DATASETS_CONFIG = {
     }
 }
 
-# --- DICCIONARIO DE CORRECCIÓN DE PAÍSES ---
+# Diccionario de corrección (Sigue siendo útil para la búsqueda inicial)
 COUNTRY_MAPPING = {
     'United States of America': 'United States',
     'USA': 'United States',
@@ -51,10 +51,10 @@ COUNTRY_MAPPING = {
     'Republic of South Africa': 'South Africa',
     'Türkiye': 'Turkey',
     'Burma': 'Myanmar',
-    'New Zeland': 'New Zealand', # Typo detectado
+    'New Zeland': 'New Zealand',
     'DPR Korea': 'North Korea',
-    'Korea': 'South Korea', # Asumimos Sur por defecto si es ambiguo
-    'England': 'United Kingdom', # Opcional: Estandarización UK
+    'Korea': 'South Korea',
+    'England': 'United Kingdom',
     'Scotland': 'United Kingdom',
     'Wales': 'United Kingdom'
 }
@@ -64,7 +64,6 @@ COUNTRY_MAPPING = {
 # ==========================================
 
 def upload_directory_to_s3(local_path, s3_folder_name, specific_file=None):
-    """Sube archivos recursivamente a S3."""
     files = glob.glob(f"{local_path}/**", recursive=True)
     for local_file in files:
         if os.path.isfile(local_file):
@@ -77,7 +76,6 @@ def upload_directory_to_s3(local_path, s3_folder_name, specific_file=None):
             s3_client.upload_file(local_file, S3_BUCKET, s3_key)
 
 def handler(event, context):
-    """Lambda de Ingesta (Descarga -> S3)"""
     try:
         print(f"🚀 Iniciando Ingesta...")
         if os.path.exists("/tmp/datasets"):
@@ -102,7 +100,6 @@ def handler(event, context):
 # ==========================================
 
 def read_csv_from_s3_robust(bucket, key):
-    """Lee CSV intentando varios encodings."""
     encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'ISO-8859-1']
     for encoding in encodings:
         try:
@@ -114,13 +111,11 @@ def read_csv_from_s3_robust(bucket, key):
     return pd.read_csv(obj['Body'], encoding='utf-8', encoding_errors='replace')
 
 def standardize_country(country_name):
-    """Normaliza nombres de países usando el diccionario maestro."""
     if pd.isna(country_name): return "Unknown"
     name = str(country_name).strip()
-    return COUNTRY_MAPPING.get(name, name) # Devuelve el mapeo o el original si no existe
+    return COUNTRY_MAPPING.get(name, name)
 
 def normalize_text(text):
-    """Normalización básica para primera pasada."""
     if pd.isna(text): return ""
     text = str(text).lower().strip()
     remove_words = ['stadium', 'estadio', 'stadion', 'arena', 'fc', 'club']
@@ -129,30 +124,50 @@ def normalize_text(text):
     text = unicodedata.normalize('NFD', text).encode('ascii', 'ignore').decode("utf-8")
     return text.strip()
 
-def get_coordinates_aws(stadium, city, country, index_name):
-    """Obtiene coordenadas usando AWS Location Service."""
+def get_coordinates_and_enrich(stadium, city, country, index_name):
+    """
+    Obtiene Coordenadas + ISO Country + Region + Dirección Oficial
+    Devuelve un diccionario con los datos enriquecidos.
+    """
     text = f"{stadium}, {city}, {country}"
+    
+    # Función auxiliar para procesar la respuesta de AWS
+    def extract_data(resp):
+        if not resp['Results']: return None
+        
+        place = resp['Results'][0]['Place']
+        point = place['Geometry']['Point'] # [Lon, Lat]
+        
+        return {
+            'lat': point[1],
+            'lon': point[0],
+            'iso_country': place.get('Country', None), # Ej: "ESP", "USA"
+            'region': place.get('Region', None),       # Ej: "Madrid", "California"
+            'official_address': place.get('Label', None) # Ej: "Santiago Bernabéu, Av. Concha Espina..."
+        }
+
     try:
+        # Intento 1: Búsqueda completa
         response = location_client.search_place_index_for_text(
             IndexName=index_name, Text=text, MaxResults=1
         )
-        if response['Results']:
-            point = response['Results'][0]['Place']['Geometry']['Point']
-            return point[1], point[0]
+        data = extract_data(response)
+        if data: return data
             
-        # Fallback: Solo ciudad
+        # Intento 2: Fallback (Solo ciudad)
         response = location_client.search_place_index_for_text(
             IndexName=index_name, Text=f"{city}, {country}", MaxResults=1
         )
-        if response['Results']:
-            point = response['Results'][0]['Place']['Geometry']['Point']
-            return point[1], point[0]
+        data = extract_data(response)
+        if data: return data
+            
     except Exception:
         pass
-    return None, None
+        
+    # Si todo falla, devolvemos vacíos
+    return {'lat': None, 'lon': None, 'iso_country': None, 'region': None, 'official_address': None}
 
 def spatial_deduplication(df, distance_threshold_deg=0.003):
-    """Elimina duplicados geográficos cercanos (~300m)."""
     print("📍 Iniciando Deduplicación Geoespacial...")
     
     def name_quality(name):
@@ -182,9 +197,8 @@ def spatial_deduplication(df, distance_threshold_deg=0.003):
     return df.loc[kept_indices].drop(columns=['name_score'])
 
 def cleaner_handler(event, context):
-    """Lambda de Limpieza, Geolocalización y Deduplicación Final"""
     try:
-        print("⚽ Iniciando Pipeline ETL + Geo...")
+        print("⚽ Iniciando Pipeline ETL + Geo Enriquecido...")
         place_index = os.environ.get('PLACE_INDEX', 'stadiums-place-index')
 
         # 1. Carga de Datos
@@ -198,8 +212,6 @@ def cleaner_handler(event, context):
         for src in sources:
             try:
                 df = read_csv_from_s3_robust(S3_BUCKET, src['key'])
-                
-                # Normalización columnas
                 col_map = {'stadium_name': 'Stadium', 'location': 'City', 'country': 'Country', 'total_capacity': 'Capacity'}
                 df = df.rename(columns={k: v for k,v in col_map.items() if k in df.columns})
                 
@@ -209,12 +221,8 @@ def cleaner_handler(event, context):
                 if set(['Stadium', 'City', 'Capacity']).issubset(df.columns):
                     df['Capacity'] = df['Capacity'].astype(str).str.replace(',', '').str.extract(r'(\d+)')[0]
                     df['Capacity'] = pd.to_numeric(df['Capacity'], errors='coerce').fillna(0).astype(int)
-                    
-                    # --- NUEVO: CORRECCIÓN DE PAÍS ---
                     if 'Country' in df.columns:
                         df['Country'] = df['Country'].apply(standardize_country)
-                    # ---------------------------------
-                    
                     dfs.append(df[['Stadium', 'City', 'Country', 'Capacity']])
             except Exception as e:
                 print(f"⚠️ Error leyendo {src['key']}: {e}")
@@ -225,45 +233,56 @@ def cleaner_handler(event, context):
         full_df = pd.concat(dfs, ignore_index=True)
         candidates = full_df[full_df['Capacity'] >= 40000].copy()
         
-        # Deduplicación básica por texto (incluyendo el país corregido)
+        # Deduplicación preliminar
         candidates['norm_name'] = candidates['Stadium'].apply(normalize_text)
         candidates['norm_country'] = candidates['Country'].apply(normalize_text)
         candidates = candidates.drop_duplicates(subset=['norm_name', 'norm_country'])
         candidates = candidates.drop(columns=['norm_name', 'norm_country'])
         
-        print(f"🏆 Candidatos a geolocalizar: {len(candidates)}")
+        print(f"🏆 Candidatos a geolocalizar y enriquecer: {len(candidates)}")
 
-        # 3. Geocodificación Paralela
+        # 3. GEOCODIFICACIÓN + ENRIQUECIMIENTO
         print("🌍 Geolocalizando en paralelo...")
         rows = candidates.to_dict('records')
-        results = [None] * len(rows)
+        enriched_results = [None] * len(rows)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_map = {executor.submit(get_coordinates_aws, r['Stadium'], r['City'], r.get('Country',''), place_index): i for i, r in enumerate(rows)}
+            future_map = {
+                executor.submit(
+                    get_coordinates_and_enrich, 
+                    r['Stadium'], r['City'], r.get('Country',''), place_index
+                ): i for i, r in enumerate(rows)
+            }
+            
             for future in concurrent.futures.as_completed(future_map):
                 idx = future_map[future]
                 try:
-                    results[idx] = future.result()
+                    enriched_results[idx] = future.result()
                 except:
-                    results[idx] = (None, None)
+                    enriched_results[idx] = {'lat': None, 'lon': None} # Fallback vacío
 
-        candidates['Latitude'] = [r[0] for r in results]
-        candidates['Longitude'] = [r[1] for r in results]
-        
+        # 4. Asignación de nuevas columnas enriquecidas
+        candidates['Latitude'] = [r['lat'] for r in enriched_results]
+        candidates['Longitude'] = [r['lon'] for r in enriched_results]
+        candidates['ISO_Country'] = [r['iso_country'] for r in enriched_results]
+        candidates['Region'] = [r['region'] for r in enriched_results]
+        candidates['Official_Address'] = [r['official_address'] for r in enriched_results]
+
+        # Filtrar no encontrados
         candidates = candidates.dropna(subset=['Latitude'])
 
-        # 4. Deduplicación Geoespacial
+        # 5. Deduplicación Geoespacial
         final_df = spatial_deduplication(candidates)
         
-        print(f"📉 Estadios únicos finales: {len(final_df)}")
+        print(f"✅ Estadios finales enriquecidos: {len(final_df)}")
 
-        # 5. Guardar
+        # 6. Guardar
         clean_key = "clean/world_cup_candidates.parquet"
         buf = io.BytesIO()
         final_df.to_parquet(buf, index=False)
         s3_client.put_object(Bucket=S3_BUCKET, Key=clean_key, Body=buf.getvalue())
         
-        return {"statusCode": 200, "body": f"OK. {len(final_df)} estadios."}
+        return {"statusCode": 200, "body": f"OK. {len(final_df)} estadios enriquecidos."}
 
     except Exception as e:
         print(f"❌ Error: {e}")
